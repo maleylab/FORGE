@@ -1,0 +1,25 @@
+# -----------------------------------------------------------------------------
+# ORCA {{ job_kind|default('job') }} input (Jinja2 template)
+# Method/basis defaults may be overridden by parameters:
+#   method='M06', basis_main='def2-SVP', ri=True, pal=8,
+#   aux_coulomb='Def2/J', aux_density='def2-SVP/C'
+# Geometry is fully inlined via {{ geometry_block }} (no xyzfile).
+# Constraints: no Grid keyword; no explicit %scf blocks.
+# ORCA version: 6.1+
+# -----------------------------------------------------------------------------
+
+! { method|default('M06') } { basis_main|default('def2-SVP') } { 'RIJCOSX' if ri|default(true) else '' } PAL{ pal|default(8) } TightSCF
+
+%maxcore { maxcore|default(4000) }
+
+# Triplet single-point on a singlet-optimized geometry
+* xyz { charge } 3
+{ '{ geometry_block }' }
+*
+
+%basis
+  NewGTO  { '{ aux_coulomb|default("Def2/J") }' } end
+  NewAux  { '{ aux_density|default("def2-SVP/C") }' } end
+end
+
+# -----------------------------------------------------------------------------

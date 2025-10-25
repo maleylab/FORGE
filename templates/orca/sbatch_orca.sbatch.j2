@@ -1,0 +1,27 @@
+# -----------------------------------------------------------------------------
+# SLURM sbatch script for ORCA (Jinja2 template)
+# Uses variables: job_name, time, account, partition, ntasks, cpus_per_task, mem
+# and orca_cmd (e.g., '/path/to/orca job.inp > job.out')
+# -----------------------------------------------------------------------------
+#!/usr/bin/env bash
+#SBATCH -J {{ job_name|default('orca_job') }}
+#SBATCH -t {{ time|default('24:00:00') }}
+#SBATCH -A {{ account|default('def-youracct') }}
+#SBATCH -p {{ partition|default('cpubase') }}
+#SBATCH -N 1
+#SBATCH --ntasks={{ ntasks|default(1) }}
+#SBATCH --cpus-per-task={{ cpus_per_task|default(8) }}
+#SBATCH --mem={{ mem|default('16G') }}
+#SBATCH -o {{ job_name|default('orca_job') }}.%j.out
+#SBATCH -e {{ job_name|default('orca_job') }}.%j.err
+
+set -euo pipefail
+echo "Running on $(hostname) at $(date)"
+echo "SLURM_NTASKS=$SLURM_NTASKS  SLURM_CPUS_PER_TASK=$SLURM_CPUS_PER_TASK"
+
+# Load ORCA if needed (Compute Canada style)
+# module load orca/6.1
+
+{{ orca_cmd }}
+echo "Done at $(date)"
+# -----------------------------------------------------------------------------

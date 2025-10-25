@@ -1,0 +1,6 @@
+! SP M06 def2-SVP Def2/J RIJCOSX PAL{{ cpus | default(8) }} NoFinalGrid
+* xyz {{ charge | default(0) }} {{ mult | default(1) }}
+{% for atom in atoms -%}
+{{ "%-2s %10.6f %10.6f %10.6f"|format(atom.symbol, atom.x, atom.y, atom.z) }}
+{% endfor -%}
+*

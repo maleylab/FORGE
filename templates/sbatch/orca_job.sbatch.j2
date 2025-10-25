@@ -1,0 +1,21 @@
+#!/bin/bash
+#SBATCH --job-name={{ job_name | default('orca_job') }}
+#SBATCH --time={{ time | default('02:00:00') }}
+#SBATCH --account={{ account | default('def-yourpi') }}
+#SBATCH --cpus-per-task={{ cpus | default(8) }}
+#SBATCH --mem={{ mem | default('8G') }}
+#SBATCH --output=%x-%j.out
+
+module purge
+module load {{ orca_module | default('orca/6.1') }}
+
+SCRATCH=${SCRATCH:-$PWD}
+JOBDIR="$SCRATCH/{{ job_name | default('orca_job') }}_${SLURM_JOB_ID}"
+mkdir -p "$JOBDIR"
+cd "$JOBDIR"
+
+cp "{{ input_path }}" ./job.inp
+orca job.inp > job.out
+
+SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
+cp -r "$JOBDIR" "$SUBMIT_DIR/."

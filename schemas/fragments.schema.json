@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "fragments.schema",
+  "type": "object",
+  "required": [
+    "version"
+  ],
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "by_structure": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": [
+            "name",
+            "atoms"
+          ],
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "atoms": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "by_job": {
+      "$ref": "#/properties/by_structure"
+    },
+    "options": {
+      "type": "object",
+      "properties": {
+        "indexing": {
+          "enum": [
+            "0-based",
+            "1-based"
+          ]
+        },
+        "validate_from_xyz": {
+          "type": "boolean"
+        },
+        "fail_on_missing": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
