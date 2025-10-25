@@ -2,10 +2,10 @@ from __future__ import annotations
 from typing import List, Dict
 
 def compute_energetic_span(states: List[Dict]) -> Dict:
-    \"\"\"Compute energetic span deltaE (kcal/mol).
+    """Compute energetic span deltaE (kcal/mol).
     Input: list of dicts with keys: label, kind in {'TS','I'}, G (kcal/mol).
     Returns: dict with deltaE_kcal_mol, TDTS, TDI, pair.
-    \"\"\"
+    """
     ts = [s for s in states if s.get("kind") == "TS"]
     ints = [s for s in states if s.get("kind") in ("I", "Int", "INT")]
     if not ts or not ints:

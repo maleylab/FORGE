@@ -1,0 +1,17 @@
+# -----------------------------------------------------------------------------
+# ORCA NMR (Jinja2) — aux basis on bang line; no %basis block.
+# -----------------------------------------------------------------------------
+! {{ method|default('M06') }} {{ basis_main|default('def2-SVP') }}
+  {{ 'RIJCOSX' if ri|default(true) else '' }} PAL{{ pal|default(8) }}
+  {{ aux_coulomb|default('Def2/J') }} {{ aux_density|default('def2-SVP/C') }}
+  NMR TightSCF
+
+%maxcore {{ maxcore|default(4000) }}
+
+* xyz {{ charge }} {{ multiplicity }}
+{{ geometry_block }}
+*
+
+# After NMR, runner can create a .wfx via:
+#   $EBROOTORCA/orca_2aim {{ input_basename }}
+# (strip .inp before calling orca_2aim)

@@ -74,7 +74,7 @@ def validate_fragments_for_job(frags: Dict[str, Any], job: Dict[str, Any], xyz_p
     errors = []
     if not frag_list:
         if frags.get('options', {}).get('fail_on_missing', False):
-            return False, [f'No fragments found for job {job.get('id')} ({xyz_path})'], []
+            return False, [f'No fragments found for job {job.get("id")} ({xyz_path})'], []
         return True, [], []
     atom_count = _count_atoms_from_xyz(xyz_path)
     indexing = frags.get('options', {}).get('indexing', '0-based')

@@ -10,7 +10,7 @@ def _run(cmd: str) -> str:
         return f"__ERROR__: {e}"
 
 def provenance_snapshot(project: Optional[str] = None) -> Dict[str, Any]:
-    \"\"\"Collect a lightweight, reproducible runtime snapshot (safe on local or HPC).\"\"\"
+    """Collect a lightweight, reproducible runtime snapshot (safe on local or HPC)."""
     module_list = _run("module list -t")
     git_sha = _run("git rev-parse HEAD")
     if git_sha.startswith("__ERROR__"):

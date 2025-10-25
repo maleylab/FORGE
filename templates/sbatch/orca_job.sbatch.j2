@@ -1,21 +1,74 @@
-#!/bin/bash
-#SBATCH --job-name={{ job_name | default('orca_job') }}
-#SBATCH --time={{ time | default('02:00:00') }}
-#SBATCH --account={{ account | default('def-yourpi') }}
-#SBATCH --cpus-per-task={{ cpus | default(8) }}
-#SBATCH --mem={{ mem | default('8G') }}
-#SBATCH --output=%x-%j.out
+cat > ~/lab-tools/templates/orca/sbatch_orca.sbatch.j2 <<'J2'
+#!/usr/bin/env bash
+#SBATCH -J {{ job_name }}
+#SBATCH -A def-smaley
+#SBATCH -t {{ time|default("24:00:00") }}
+#SBATCH -N 1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task={{ cpus_per_task|default(8) }}
+#SBATCH --mem={{ mem|default("16G") }}
+#SBATCH -o %x.%j.out
+#SBATCH -e %x.%j.err
 
+set -euo pipefail
+
+# Submit dir and scratch
+SRC_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
+SCRATCH_ROOT="${SLURM_TMPDIR:-/tmp}"
+WORK_DIR="$SCRATCH_ROOT/${USER}_${SLURM_JOB_ID}_${SLURM_JOB_NAME}"
+mkdir -p "$WORK_DIR"
+
+echo "Submit dir: $SRC_DIR"
+echo "Work dir:   $WORK_DIR"
+echo "Host:       $(hostname)"
+echo "Start:      $(date)"
+
+# Load ORCA (Compute Canada)
 module purge
-module load {{ orca_module | default('orca/6.1') }}
+module load orca/6.1.0
 
-SCRATCH=${SCRATCH:-$PWD}
-JOBDIR="$SCRATCH/{{ job_name | default('orca_job') }}_${SLURM_JOB_ID}"
-mkdir -p "$JOBDIR"
-cd "$JOBDIR"
+# Input/output basenames (passed in from CLI via orca_cmd)
+# Expect orca_cmd like: "orca optfreq.inp > optfreq.out"
+INP_BASENAME="{{ inp_basename }}"
+OUT_BASENAME="{{ out_basename }}"
 
-cp "{{ input_path }}" ./job.inp
-orca job.inp > job.out
+# Stage-in
+cp -a "$SRC_DIR/$INP_BASENAME" "$WORK_DIR/"
+cd "$WORK_DIR"
 
-SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
-cp -r "$JOBDIR" "$SUBMIT_DIR/."
+# Run
+set +e
+{{ orca_cmd }}
+rc=$?
+set -e
+echo "ORCA exit code: $rc"
+
+# Package: keep main .out as-is; tar+compress everything else
+LARGE_BYTES=${LARGE_BYTES:-10485760}  # 10 MiB threshold (tunable via env)
+OUT_FILE="$OUT_BASENAME"
+
+# tar everything except the main .out and the SLURM std logs
+tar --exclude="$OUT_FILE" --exclude="*.out" --exclude="*.err" -czf other_artifacts.tar.gz . || true
+
+# If .out exists and is > threshold, keep as-is; otherwise it’s still copied as-is
+if [ -f "$OUT_FILE" ]; then
+  OUT_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo 0)
+  echo "OUT size: $OUT_SIZE bytes"
+fi
+
+# Stage-back
+mkdir -p "$SRC_DIR"
+# Copy main ORCA .out as-is (if present)
+if [ -f "$OUT_FILE" ]; then
+  cp -a "$OUT_FILE" "$SRC_DIR/"
+fi
+# Copy tarball of everything else
+if [ -f other_artifacts.tar.gz ]; then
+  cp -a other_artifacts.tar.gz "$SRC_DIR/"
+fi
+
+echo "Results staged back to: $SRC_DIR"
+echo "End: $(date)"
+exit "$rc"
+J2
+

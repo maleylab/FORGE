@@ -1,0 +1,38 @@
+# Python / build
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+.cache/
+
+# venvs
+venv/
+.env/
+.venv/
+*/.venv/
+
+# editor/OS
+.DS_Store
+*.swp
+*.swo
+
+# run artifacts
+*.out
+*.err
+*.gbw
+*.engrad
+*.hess
+*.qfi
+*.prop
+*.md
+*.orbitals
+*.tar
+*.tar.gz
+
+# labtools scratch / results
+results.jsonl
+results.parquet
+results.csv

@@ -1,0 +1,10 @@
+{
+  "timestamp": "2025-10-25T18:35:40Z",
+  "host": "rorqual1",
+  "python": "3.11.4",
+  "git_sha": "8fb6c7aefbaadc9873b0dd415de0671350c3349d",
+  "env": {
+    "EBROOTORCA": "/cvmfs/restricted.computecanada.ca/easybuild/software/2023/x86-64-v4/MPI/gcc12/openmpi4/orca/6.1.0"
+  },
+  "env_hash": "72e905a99934b7d6"
+}

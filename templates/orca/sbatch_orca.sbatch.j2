@@ -1,27 +1,70 @@
-# -----------------------------------------------------------------------------
-# SLURM sbatch script for ORCA (Jinja2 template)
-# Uses variables: job_name, time, account, partition, ntasks, cpus_per_task, mem
-# and orca_cmd (e.g., '/path/to/orca job.inp > job.out')
-# -----------------------------------------------------------------------------
 #!/usr/bin/env bash
-#SBATCH -J {{ job_name|default('orca_job') }}
-#SBATCH -t {{ time|default('24:00:00') }}
-#SBATCH -A {{ account|default('def-youracct') }}
-#SBATCH -p {{ partition|default('cpubase') }}
+#SBATCH -J {{ job_name }}
+#SBATCH -A def-smaley
+#SBATCH -t {{ time|default("24:00:00") }}
 #SBATCH -N 1
-#SBATCH --ntasks={{ ntasks|default(1) }}
+#SBATCH --ntasks=1
 #SBATCH --cpus-per-task={{ cpus_per_task|default(8) }}
-#SBATCH --mem={{ mem|default('16G') }}
-#SBATCH -o {{ job_name|default('orca_job') }}.%j.out
-#SBATCH -e {{ job_name|default('orca_job') }}.%j.err
+#SBATCH --mem={{ mem|default("16G") }}
+#SBATCH -o %x.%j.out
+#SBATCH -e %x.%j.err
 
 set -euo pipefail
-echo "Running on $(hostname) at $(date)"
-echo "SLURM_NTASKS=$SLURM_NTASKS  SLURM_CPUS_PER_TASK=$SLURM_CPUS_PER_TASK"
 
-# Load ORCA if needed (Compute Canada style)
-# module load orca/6.1
+# Submit dir and node-local scratch
+SRC_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
+SCRATCH_ROOT="${SLURM_TMPDIR:-/tmp}"
+WORK_DIR="$SCRATCH_ROOT/${USER}_${SLURM_JOB_ID}_${SLURM_JOB_NAME}"
+mkdir -p "$WORK_DIR"
 
-{{ orca_cmd }}
-echo "Done at $(date)"
-# -----------------------------------------------------------------------------
+echo "Submit dir: $SRC_DIR"
+echo "Work dir:   $WORK_DIR"
+echo "Host:       $(hostname)"
+echo "Start:      $(date)"
+
+# Modules (Compute Canada)
+module purge
+module load orca/6.1.0
+
+# SMP threading: 1 MPI rank, many threads
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+# Keep vendor libs single-threaded so ORCA owns the cores
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+# Tell OpenMPI inside ORCA not to error on "slots"
+export OMPI_MCA_rmaps_base_oversubscribe=1
+
+# Basenames from prep()
+INP_BASENAME="{{ inp_basename }}"
+OUT_BASENAME="{{ out_basename }}"
+
+# Stage-in
+cp -a "$SRC_DIR/$INP_BASENAME" "$WORK_DIR/"
+cd "$WORK_DIR"
+
+# Sanity
+if [ -z "${EBROOTORCA:-}" ]; then
+  echo "ERROR: EBROOTORCA is not set after 'module load orca/6.1.0'." >&2
+  exit 97
+fi
+
+# Run ORCA directly (no srun/mpirun) in SMP mode
+set +e
+"${EBROOTORCA}/orca" "$INP_BASENAME" > "$OUT_BASENAME"
+rc=$?
+set -e
+echo "ORCA exit code: $rc"
+
+# Package: keep main .out; compress everything else
+tar --exclude="$OUT_BASENAME" --exclude="*.out" --exclude="*.err" -czf other_artifacts.tar.gz . || true
+
+# Stage-back to submit dir
+mkdir -p "$SRC_DIR"
+[ -f "$OUT_BASENAME" ] && cp -a "$OUT_BASENAME" "$SRC_DIR/"
+[ -f other_artifacts.tar.gz ] && cp -a other_artifacts.tar.gz "$SRC_DIR/"
+
+echo "Results staged back to: $SRC_DIR"
+echo "End: $(date)"
+exit "$rc"
