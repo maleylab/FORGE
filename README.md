@@ -4,6 +4,8 @@ FORGE is an automation toolkit for running high-throughput quantum chemistry wor
 
 <p align="center">
 <img width="246" height="302" alt="FORGE" src="https://github.com/user-attachments/assets/a5a705a4-fed9-4c07-bd14-87313752d2da" />
+</p>
+<p align="center">
 Framework for ORCA Run Generation and Execution.
 </p>
 
