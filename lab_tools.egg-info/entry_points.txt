@@ -1,0 +1,2 @@
+[console_scripts]
+labtools = labtools.cli:app
