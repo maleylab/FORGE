@@ -1,0 +1,13 @@
+# -----------------------------------------------------------------------------
+# ORCA SP (triplet) (Jinja2) — aux basis on bang line; no %basis block.
+# -----------------------------------------------------------------------------
+! {{ method|default('M06') }} {{ basis_main|default('def2-SVP') }}
+  {{ 'RIJCOSX' if ri|default(true) else '' }} PAL{{ pal|default(8) }}
+  {{ aux_coulomb|default('Def2/J') }} {{ aux_density|default('def2-SVP/C') }}
+  TightSCF
+
+%maxcore {{ maxcore|default(4000) }}
+
+* xyz {{ charge }} 3
+{{ geometry_block }}
+*

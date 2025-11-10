@@ -1,0 +1,71 @@
+#!/bin/bash
+#SBATCH --job-name={{ job_name|default("array") }}
+#SBATCH --time={{ time|default("24:00:00") }}
+#SBATCH --cpus-per-task={{ cpus_per_task|default(8) }}
+#SBATCH --mem={{ mem|default("16G") }}
+#SBATCH --account={{ account|default("def-smaley") }}
+#SBATCH --array=0-{{ inputs|length - 1 }}
+
+set -euo pipefail
+export OMP_NUM_THREADS=1
+ulimit -s unlimited
+
+# Inputs: Jinja must pass a JSON-ish bash array of absolute paths to .inp files.
+# Example from dispatcher: inputs=["/abs/path/job1/optfreq.inp","/abs/path/job2/optfreq.inp"]
+INPUTS=( {% for p in inputs %}"{{ p }}"{% if not loop.last %} {% endif %}{% endfor %} )
+
+if [[ -z "${EBROOTORCA:-}" ]]; then
+  echo "[FATAL] EBROOTORCA not set"; exit 1
+fi
+
+run_one() {
+  local INP="$1"
+  local JOBDIR
+  JOBDIR="$(dirname "$INP")"
+  local INP_BN
+  INP_BN="$(basename "$INP")"
+  local OUT_BN="${INP_BN%.inp}.out"
+
+  echo "[$(date -Is)] Task $$ handling: $INP"
+
+  # ----- Stage to node-local scratch -----
+  SCR="${SLURM_TMPDIR:-/tmp}/job.$$"
+  mkdir -p "$SCR"
+  mapfile -t FILES < <(printf "%s\n" "$JOBDIR"/*)
+  rsync -a --info=progress2 --exclude="__packed__/" --exclude="*.tar.gz" "${FILES[@]}" "$SCR/"
+
+  pushd "$SCR" >/dev/null
+
+  # ----- Run ORCA -----
+  echo "[$(date -Is)] Running: ${EBROOTORCA}/orca \"$INP_BN\" > \"$OUT_BN\""
+  "${EBROOTORCA}/orca" "$INP_BN" > "$OUT_BN"
+
+  # ----- Pack heavy artifacts (mirrors single_orca_job.sbatch.j2) -----
+  PACK_DIR="__packed__"; mkdir -p "$PACK_DIR"
+  PACK_GLOBS=( {% for g in PACK_GLOBS|default(["*bib*", "*.densities*", "*.densitiesinfo*", "*.gbw", "*.property.txt", "*.hess", "*.engrad", "*.molden.input", "*.wfx", "*.wfn", "*.svc", "*.plt", "*.nat", "*.uno", "*.dftgrid", "*.tmp", "*.tmp*", "*.cis", "*.tda", "*.td", "*.optdens", "*.ase", "*.grid", "*.cube", "*.orca", "*.trj", "*.trjectory", "*.md", "*.irc", "*.neb"]) %}"{{ g }}"{% if not loop.last %} {% endif %}{% endfor %} )
+  moved_any=0
+  for g in "${PACK_GLOBS[@]}"; do
+    shopt -s nullglob
+    for f in $g; do
+      [[ -f "$f" ]] || continue
+      mv -f "$f" "$PACK_DIR/" && moved_any=1
+    done
+  done
+  if [[ "$moved_any" -eq 1 ]]; then
+    TAR_BN="$(basename "$JOBDIR")_$(date +%s).tar.gz"
+    tar -czf "$TAR_BN" "$PACK_DIR"
+    rm -rf "$PACK_DIR"
+  fi
+
+  # ----- Sync back -----
+  popd >/dev/null
+  rsync -a --info=progress2 "$SCR/" "$JOBDIR/"
+  rm -rf "$SCR"
+  echo "[$(date -Is)] Done: $INP"
+}
+
+IDX="${SLURM_ARRAY_TASK_ID:?}"
+if (( IDX < 0 || IDX >= ${#INPUTS[@]} )); then
+  echo "[FATAL] SLURM_ARRAY_TASK_ID out of bounds"; exit 2
+fi
+run_one "${INPUTS[$IDX]}"

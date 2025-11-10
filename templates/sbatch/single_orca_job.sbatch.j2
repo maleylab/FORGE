@@ -1,0 +1,100 @@
+#!/bin/bash
+#SBATCH --job-name={{ job_name }}
+#SBATCH --time={{ time }}
+#SBATCH --ntasks={{ nprocs }}
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu={{ mem }}
+#SBATCH --account=def-smaley
+
+set -euo pipefail
+
+export OMP_NUM_THREADS=1
+ulimit -s unlimited
+
+if [[ -z "${EBROOTORCA:-}" ]]; then echo "[ERR] EBROOTORCA not set"; exit 2; fi
+
+SRC_DIR="{{ SRC_DIR }}"
+INP_BN="{{ inp_basename }}"
+if [[ -z "${SRC_DIR}" || -z "${INP_BN}" ]]; then echo "[ERR] SRC_DIR or inp_basename missing"; exit 2; fi
+if [[ "${SRC_DIR}" == "/" ]]; then echo "[ERR] Refusing to stage from /"; exit 2; fi
+if [[ ! -f "${SRC_DIR}/${INP_BN}" ]]; then echo "[ERR] Input not found: ${SRC_DIR}/${INP_BN}"; exit 2; fi
+
+choose_scratch() {
+  local jid="${SLURM_JOB_ID:-$$}"
+  local aidx="${SLURM_ARRAY_TASK_ID:-}"
+  local tag="$jid${aidx:+.$aidx}"
+  for d in "${SLURM_TMPDIR:-}" "/scratch/${USER}/${tag}" "/localscratch/${tag}" "/local/${USER}/${tag}" "/tmp/${USER}/${tag}"; do
+    [[ -n "$d" ]] || continue
+    mkdir -p "$d" 2>/dev/null || true
+    [[ -d "$d" && -w "$d" ]] && { echo "$d"; return; }
+  done
+  mktemp -d "/tmp/${USER}/job.${jid}.XXXXXX"
+}
+WORKROOT="$(choose_scratch)"
+WORKDIR="${WORKROOT}/job"
+mkdir -p "${WORKDIR}"
+
+echo "[$(date -Is)] Node: $(hostname)"
+echo "[$(date -Is)] Source dir: ${SRC_DIR}"
+echo "[$(date -Is)] Work dir: ${WORKDIR}"
+
+# Stage input + optional auxiliaries (e.g., starting .gbw)
+shopt -s nullglob
+FILES=( "${SRC_DIR}/${INP_BN}" )
+EXTRAS=( {% for g in RSYNC_GLOBS|default(["*bib*", "*.engrad", "*.densi*", "*.gbw","*.hess","*.aux","*.molden.input","*.pcmo"]) %}"{{ g }}"{% if not loop.last %} {% endif %}{% endfor %} )
+for g in "${EXTRAS[@]}"; do
+  for f in "${SRC_DIR}/$g"; do
+    [[ -f "$f" ]] && FILES+=( "$f" )
+  done
+done
+if [[ -z "${FILES[*]:-}" ]]; then
+  echo "[ERR] Nothing to stage"; exit 2
+fi
+rsync -a --ignore-missing-args --protect-args -- "${FILES[@]}" "${WORKDIR}/"
+cd "${WORKDIR}"
+
+echo "[$(date -Is)] Running: {{ orca_cmd }}"
+{{ orca_cmd }}
+
+# ---- Pack heavy artifacts ----------------------------------------------------
+PACK_DIR="__packed__"
+mkdir -p "${PACK_DIR}"
+
+# What to pack (heavies). Add/adjust globs here if needed.
+PACK_GLOBS=( {% for g in PACK_GLOBS|default(["*bib*", "*.densities", "*.densitiesinfo", "*.gbw", "*.property.txt", "*.hess", "*.engrad", "*.aux", "*.molden.input", "*.pcmo"]) %}"{{ g }}"{% if not loop.last %} {% endif %}{% endfor %} )
+
+moved_any=0
+for g in "${PACK_GLOBS[@]}"; do
+  for f in $g; do
+    [[ -f "$f" ]] || continue
+    case "$f" in
+      # keep these at top-level
+      *.inp|*.out|*.xyz|slurm-*.out|*.tar.gz) continue ;;
+    esac
+    mv -f -- "$f" "${PACK_DIR}/" && moved_any=1
+  done
+done
+
+# Compute archive name
+ARCHIVE="{{ ARCHIVE_NAME | default('') }}"
+if [[ -z "${ARCHIVE}" ]]; then
+  ARCHIVE="${SLURM_JOB_NAME:-{{ job_name }}}_${SLURM_JOB_ID:-$$}.tar.gz"
+fi
+
+if [[ "${moved_any}" -eq 1 ]]; then
+  echo "[$(date -Is)] Creating archive: ${ARCHIVE}"
+  tar -czf "${ARCHIVE}" "${PACK_DIR}"
+  rm -rf "${PACK_DIR}"
+else
+  echo "[$(date -Is)] Nothing to pack into ${PACK_DIR}"
+fi
+
+# ---- Keep essentials at top-level -------------------------------------------
+# Ensure ORCA-produced XYZ (if present) is kept; nothing to do if absent.
+# We already avoided moving *.xyz above.
+
+echo "[$(date -Is)] Syncing results → ${SRC_DIR}"
+# Return remaining files (inputs, outputs, xyz, slurm log, and archive)
+rsync -a --protect-args -- "${WORKDIR}/" "${SRC_DIR}/"
+
+echo "[$(date -Is)] Done."

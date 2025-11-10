@@ -1,0 +1,81 @@
+#!/bin/bash
+#SBATCH --job-name={{ job_name|default("drone") }}
+#SBATCH --time={{ time|default("1-00:00:00") }}
+#SBATCH --cpus-per-task={{ cpus_per_task|default(8) }}
+#SBATCH --mem={{ mem|default("16G") }}
+#SBATCH --account={{ account|default("def-smaley") }}
+
+set -euo pipefail
+export OMP_NUM_THREADS=1
+ulimit -s unlimited
+
+QUEUE_DIR="{{ QUEUE_DIR|default('forge_queue') }}"
+SLEEP_SECS="{{ SLEEP_SECS|default(60) }}"
+
+if [[ -z "${EBROOTORCA:-}" ]]; then
+  echo "[FATAL] EBROOTORCA not set"; exit 1
+fi
+
+process_one() {
+  local INP="$1"
+  local JOBDIR
+  JOBDIR="$(dirname "$INP")"
+  local INP_BN
+  INP_BN="$(basename "$INP")"
+  local OUT_BN="${INP_BN%.inp}.out"
+
+  echo "[$(date -Is)] Drone picked: $INP"
+
+  # Stage to node-local scratch
+  SCR="${SLURM_TMPDIR:-/tmp}/drone.$RANDOM.$$"
+  mkdir -p "$SCR"
+  rsync -a --exclude="__packed__/" --exclude="*.tar.gz" "$JOBDIR/" "$SCR/"
+
+  pushd "$SCR" >/dev/null
+
+  # Run ORCA
+  echo "[$(date -Is)] Running: ${EBROOTORCA}/orca \"$INP_BN\" > \"$OUT_BN\""
+  "${EBROOTORCA}/orca" "$INP_BN" > "$OUT_BN"
+
+  # Pack heavies like single-job
+  PACK_DIR="__packed__"; mkdir -p "$PACK_DIR"
+  PACK_GLOBS=( {% for g in PACK_GLOBS|default(["*bib*", "*.densities*", "*.densitiesinfo*", "*.gbw", "*.property.txt", "*.hess", "*.engrad", "*.molden.input", "*.wfx", "*.wfn", "*.svc", "*.plt", "*.nat", "*.uno", "*.dftgrid", "*.tmp", "*.tmp*", "*.cis", "*.tda", "*.td", "*.optdens", "*.ase", "*.grid", "*.cube", "*.orca", "*.trj", "*.trjectory", "*.md", "*.irc", "*.neb"]) %}"{{ g }}"{% if not loop.last %} {% endif %}{% endfor %} )
+  moved_any=0
+  for g in "${PACK_GLOBS[@]}"; do
+    shopt -s nullglob
+    for f in $g; do
+      [[ -f "$f" ]] || continue
+      mv -f "$f" "$PACK_DIR/" && moved_any=1
+    done
+  done
+  if [[ "$moved_any" -eq 1 ]]; then
+    TAR_BN="$(basename "$JOBDIR")_$(date +%s).tar.gz"
+    tar -czf "$TAR_BN" "$PACK_DIR"
+    rm -rf "$PACK_DIR"
+  fi
+
+  popd >/dev/null
+  rsync -a "$SCR/" "$JOBDIR/"
+  rm -rf "$SCR"
+  echo "[$(date -Is)] Synced back: $JOBDIR"
+}
+
+mkdir -p "$QUEUE_DIR"
+echo "[$(date -Is)] Drone watching: $QUEUE_DIR (sleep=${SLEEP_SECS}s)"
+while true; do
+  shopt -s nullglob
+  picked=""
+  for f in "$QUEUE_DIR"/*.inp; do
+    # lock file to avoid races with other drones
+    lock="${f}.lock"
+    if (set -o noclobber; : > "$lock") 2>/dev/null; then
+      picked="$f"; break
+    fi
+  done
+  if [[ -n "$picked" ]]; then
+    process_one "$picked" || true
+    rm -f "${picked}.lock"
+  else
+    sleep "$SLEEP_SECS"
+  fi
+done

@@ -1,0 +1,5 @@
+%maxcore {{ maxcore|default(4000) }}
+! {{ method|default('M06') }} {{ basis_main|default('def2-SVP') }} {{ 'RIJCOSX' if ri|default(true) else '' }} PAL{{ pal|default(8) }} {{ aux_coulomb|default('Def2/J') }} {{ aux_density|default('def2-SVP/C') }} TightSCF
+* xyz {{ charge }} {{ multiplicity }}
+{{ geometry_block | trim }}
+*

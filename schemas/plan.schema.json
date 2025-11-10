@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "plan.schema",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "jobs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "optfreq",
+              "sp",
+              "sp_triplet",
+              "nmr"
+            ]
+          },
+          "structure": {
+            "type": "string"
+          },
+          "charge": {
+            "type": "integer"
+          },
+          "mult": {
+            "type": "integer"
+          },
+          "template": {
+            "type": "string"
+          },
+          "depends_on": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "parameters": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "structure",
+          "template"
+        ]
+      }
+    }
+  },
+  "required": [
+    "version",
+    "jobs"
+  ]
+}

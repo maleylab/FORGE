@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lab-tools"
+version = "0.1.0"
+description = "General tools for a computational chemistry lab"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [{name="Maley Lab", email="smaley@wlu.ca"}]
+dependencies = [
+  "typer>=0.12",
+  "rich>=13.7",
+  "pandas>=2.1",
+  "jinja2>=3.1",
+  "pydantic>=2.6",
+  "pyyaml>=6.0",
+  "jsonschema>=4.23",
+]
+# Optional extra if you want pyarrow on machines that support it:
+# [project.optional-dependencies]
+# arrow = ["pyarrow>=15"]
+
+[project.scripts]
+labtools = "labtools.cli:app"
+
+[tool.setuptools]
+include-package-data = true
+
+# >>> src layout ONLY <<<
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# If you plan to ship templates inside your sdist/wheel,
+# keep MANIFEST.in at repo root. (Package-data mapping is not needed.)
+# [tool.setuptools.package-data]
+# labtools = ["templates/**/*.j2"]
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100

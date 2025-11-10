@@ -1,0 +1,24 @@
+! {{ method }} {{ flags | join(' ') }}
+
+%maxcore {{ maxcore_mb }}
+{% if cartesian_constraints and cartesian_constraints|length -%}
+%geom
+  Constraints
+  {%- for line in cartesian_constraints %}
+    {{ line }}
+  {%- endfor %}
+  end
+end
+{%- endif %}
+
+* xyz {{ charge }} {{ mult }}
+{{ xyz_lines | join('\n') }}
+*
+{%- if cpcm %}
+%cpcm
+  epsilon {{ cpcm.epsilon }}
+  {%- if cpcm.refrac is defined and cpcm.refrac %}
+  refrac {{ cpcm.refrac }}
+  {%- endif %}
+end
+{%- endif %}
