@@ -1,0 +1,21 @@
+schema:
+  name: test_minimal
+  version: 1
+  description: Minimal schema for csvpipe smoke testing
+
+columns:
+  system:
+    type: str
+    required: true
+
+  x:
+    type: int
+    required: true
+
+  y:
+    type: int
+    required: true
+
+expand:
+  x:
+    separator: "|"

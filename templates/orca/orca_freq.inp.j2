@@ -1,0 +1,36 @@
+! freq {{ method }}{% if basis is defined and basis %} {{ basis }}{% endif %} {{ flags | join(' ') }} {{ restart_flags | join(' ') }}
+
+%maxcore {{ maxcore_mb }}
+
+{% if pal is defined%}
+%pal
+  nprocs {{ pal }}
+end
+{% endif %}
+
+{% if scf is defined and scf %}
+%scf
+{% for key, val in scf.items() %}
+  {{ key }} {{ val }}
+{% endfor %}
+end
+{% endif %}
+
+%freq
+{% if freq %}
+  {% for key, val in freq.items() %}
+    {{ key }} {{ val }}
+  {% endfor %}
+{% endif %}
+end
+
+{% if cpcm %}
+%cpcm
+  epsilon {{ cpcm.epsilon }}
+  {% if cpcm.refrac %} refrac {{ cpcm.refrac }} {% endif %}
+end
+{% endif %}
+
+* xyz {{ charge }} {{ mult }}
+{{ geom_lines | join("\n") }}
+*

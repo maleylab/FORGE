@@ -1,81 +1,158 @@
 #!/bin/bash
-#SBATCH --job-name={{ job_name|default("drone") }}
-#SBATCH --time={{ time|default("1-00:00:00") }}
-#SBATCH --cpus-per-task={{ cpus_per_task|default(8) }}
-#SBATCH --mem={{ mem|default("16G") }}
-#SBATCH --account={{ account|default("def-smaley") }}
+#SBATCH --job-name={{ job_name }}
+#SBATCH --account=def-smaley
+#SBATCH --nodes=1
+#SBATCH --ntasks={{ nprocs }}
+#SBATCH --cpus-per-task=1
+#SBATCH --time={{ time }}
+#SBATCH --mem-per-cpu={{ mem_per_cpu }}
+#SBATCH --output={{ QUEUE_DIR }}/logs/%x_%j.out
+#SBATCH --error={{ QUEUE_DIR }}/logs/%x_%j.err
+#SBATCH --chdir={{ QUEUE_DIR }}
+#SBATCH --export=ALL
 
+# ------------------------------------------------------------------
+# STRICT MODE
+# ------------------------------------------------------------------
 set -euo pipefail
+IFS=$'\n\t'
+
+# ------------------------------------------------------------------
+# ENVIRONMENT
+# ------------------------------------------------------------------
+module purge >/dev/null 2>&1 || true
+module load orca/6.1.0
+
+ORCA_BIN="${EBROOTORCA}/orca"
+if [[ ! -x "$ORCA_BIN" ]]; then
+    echo "[DRONE] ERROR: ORCA not found at ${EBROOTORCA}/orca" >&2
+    exit 2
+fi
+
 export OMP_NUM_THREADS=1
 ulimit -s unlimited
 
-QUEUE_DIR="{{ QUEUE_DIR|default('forge_queue') }}"
-SLEEP_SECS="{{ SLEEP_SECS|default(60) }}"
+QUEUE_ROOT="{{ QUEUE_DIR }}"
+SLEEP_SECS={{ SLEEP_SECS }}
 
-if [[ -z "${EBROOTORCA:-}" ]]; then
-  echo "[FATAL] EBROOTORCA not set"; exit 1
-fi
+mkdir -p "${QUEUE_ROOT}/logs"
 
-process_one() {
-  local INP="$1"
-  local JOBDIR
-  JOBDIR="$(dirname "$INP")"
-  local INP_BN
-  INP_BN="$(basename "$INP")"
-  local OUT_BN="${INP_BN%.inp}.out"
+echo "[DRONE] Worker starting"
+echo "[DRONE] Queue root: ${QUEUE_ROOT}"
+echo "[DRONE] Sleep interval: ${SLEEP_SECS}s"
 
-  echo "[$(date -Is)] Drone picked: $INP"
+# ------------------------------------------------------------------
+# SAFETY: ALWAYS RETURN TO QUEUE ROOT
+# ------------------------------------------------------------------
+cd "${QUEUE_ROOT}"
 
-  # Stage to node-local scratch
-  SCR="${SLURM_TMPDIR:-/tmp}/drone.$RANDOM.$$"
-  mkdir -p "$SCR"
-  rsync -a --exclude="__packed__/" --exclude="*.tar.gz" "$JOBDIR/" "$SCR/"
-
-  pushd "$SCR" >/dev/null
-
-  # Run ORCA
-  echo "[$(date -Is)] Running: ${EBROOTORCA}/orca \"$INP_BN\" > \"$OUT_BN\""
-  "${EBROOTORCA}/orca" "$INP_BN" > "$OUT_BN"
-
-  # Pack heavies like single-job
-  PACK_DIR="__packed__"; mkdir -p "$PACK_DIR"
-  PACK_GLOBS=( {% for g in PACK_GLOBS|default(["*bib*", "*.densities*", "*.densitiesinfo*", "*.gbw", "*.property.txt", "*.hess", "*.engrad", "*.molden.input", "*.wfx", "*.wfn", "*.svc", "*.plt", "*.nat", "*.uno", "*.dftgrid", "*.tmp", "*.tmp*", "*.cis", "*.tda", "*.td", "*.optdens", "*.ase", "*.grid", "*.cube", "*.orca", "*.trj", "*.trjectory", "*.md", "*.irc", "*.neb"]) %}"{{ g }}"{% if not loop.last %} {% endif %}{% endfor %} )
-  moved_any=0
-  for g in "${PACK_GLOBS[@]}"; do
-    shopt -s nullglob
-    for f in $g; do
-      [[ -f "$f" ]] || continue
-      mv -f "$f" "$PACK_DIR/" && moved_any=1
-    done
-  done
-  if [[ "$moved_any" -eq 1 ]]; then
-    TAR_BN="$(basename "$JOBDIR")_$(date +%s).tar.gz"
-    tar -czf "$TAR_BN" "$PACK_DIR"
-    rm -rf "$PACK_DIR"
-  fi
-
-  popd >/dev/null
-  rsync -a "$SCR/" "$JOBDIR/"
-  rm -rf "$SCR"
-  echo "[$(date -Is)] Synced back: $JOBDIR"
+cleanup() {
+    cd "${QUEUE_ROOT}" || true
 }
+trap cleanup EXIT
 
-mkdir -p "$QUEUE_DIR"
-echo "[$(date -Is)] Drone watching: $QUEUE_DIR (sleep=${SLEEP_SECS}s)"
+# ------------------------------------------------------------------
+# MAIN WORKER LOOP
+# ------------------------------------------------------------------
 while true; do
-  shopt -s nullglob
-  picked=""
-  for f in "$QUEUE_DIR"/*.inp; do
-    # lock file to avoid races with other drones
-    lock="${f}.lock"
-    if (set -o noclobber; : > "$lock") 2>/dev/null; then
-      picked="$f"; break
+    cd "${QUEUE_ROOT}"
+
+    selected=""
+
+    # Find first READY job directory
+    for jobdir in */; do
+        [[ -d "$jobdir" ]] || continue
+        [[ -f "$jobdir/READY" ]] || continue
+        selected="$jobdir"
+        break
+    done
+
+    if [[ -z "$selected" ]]; then
+        echo "[DRONE] No READY jobs. Sleeping ${SLEEP_SECS}s..."
+        sleep "${SLEEP_SECS}"
+        continue
     fi
-  done
-  if [[ -n "$picked" ]]; then
-    process_one "$picked" || true
-    rm -f "${picked}.lock"
-  else
-    sleep "$SLEEP_SECS"
-  fi
+
+    echo "[DRONE] Selected job: ${selected}"
+
+    # --------------------------------------------------------------
+    # CLAIM JOB (atomic enough for single-node workers)
+    # --------------------------------------------------------------
+    rm -f "${selected}/READY"
+    touch "${selected}/STARTED"
+
+    # --------------------------------------------------------------
+    # PREPARE SCRATCH
+    # --------------------------------------------------------------
+    SCRATCH="${SLURM_TMPDIR}/${SLURM_JOB_ID}_${selected%/}"
+    mkdir -p "${SCRATCH}"
+
+    echo "[DRONE] Scratch directory: ${SCRATCH}"
+
+    cp -r "${selected}" "${SCRATCH}/"
+
+    # --------------------------------------------------------------
+    # RUN ORCA IN SCRATCH
+    # --------------------------------------------------------------
+    pushd "${SCRATCH}/${selected}" >/dev/null
+
+    inp="$(ls *.inp | head -n 1 || true)"
+    if [[ -z "$inp" ]]; then
+        echo "[DRONE] ERROR: No .inp file found" >&2
+        popd >/dev/null
+        cd "${QUEUE_ROOT}/${selected}"
+        rm -f STARTED
+        touch FAIL
+        continue
+    fi
+
+    echo "[DRONE] Running ORCA: ${ORCA_BIN} ${inp}"
+    "${ORCA_BIN}" "${inp}" > "${inp%.inp}.out" 2>&1 || true
+
+    # --------------------------------------------------------------
+    # PACKAGE HEAVY ARTIFACTS
+    # --------------------------------------------------------------
+    mkdir -p __packed__
+    mv *.gbw *.hess *.densities *.engrad __packed__ 2>/dev/null || true
+
+    if compgen -G "__packed__/*" >/dev/null; then
+        tar czf __packed__.tar.gz __packed__
+        rm -rf __packed__
+    else
+        rmdir __packed__ 2>/dev/null || true
+    fi
+
+    popd >/dev/null
+
+    # --------------------------------------------------------------
+    # COPY RESULTS BACK
+    # --------------------------------------------------------------
+    pushd "${QUEUE_ROOT}/${selected}" >/dev/null
+
+    rm -f STARTED
+
+    cp "${SCRATCH}/${selected}"/*.out . 2>/dev/null || true
+    cp "${SCRATCH}/${selected}"/*.xyz . 2>/dev/null || true
+    cp "${SCRATCH}/${selected}"/*.log . 2>/dev/null || true
+    cp "${SCRATCH}/${selected}"/__packed__.tar.gz . 2>/dev/null || true
+
+    # --------------------------------------------------------------
+    # MARK DONE OR FAIL
+    # --------------------------------------------------------------
+    if ls *.out >/dev/null 2>&1; then
+        touch DONE
+        echo "[DRONE] Job completed: ${selected}"
+    else
+        touch FAIL
+        echo "[DRONE] Job FAILED: ${selected}"
+    fi
+
+    popd >/dev/null
+
+    # --------------------------------------------------------------
+    # CLEAN SCRATCH
+    # --------------------------------------------------------------
+    rm -rf "${SCRATCH}"
+
+    sleep 1
 done

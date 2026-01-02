@@ -1,0 +1,38 @@
+#!/bin/bash
+#SBATCH --job-name={{ job_name }}
+#SBATCH --nodes=1
+#SBATCH --ntasks={{ nprocs | default(1) }}
+#SBATCH --cpus-per-task=1
+#SBATCH --time={{ time }}
+#SBATCH --mem-per-cpu={{ mem_per_cpu | default("2G") }}
+#SBATCH --account=def-smaley
+
+set -euo pipefail
+
+module purge
+module load orca/6.1.0
+
+# ORCA uses OMP threads only for XTB/SCF parallelism
+export OMP_NUM_THREADS={{ nprocs | default(1) }}
+
+# Scratch
+SCRATCH="$SLURM_TMPDIR/{{ job_name }}"
+mkdir -p "$SCRATCH"
+
+# Copy input
+cp "{{ inp_path }}" "$SCRATCH/"
+cd "$SCRATCH"
+
+# Run ORCA
+${EBROOTORCA}/orca "{{ inp_basename }}" > "{{ out_basename }}"
+
+# Pack large artifacts
+mkdir -p __packed__
+mv *.gbw *.densities *.wfn *.wfx *.molden* __packed__/ 2>/dev/null || true
+tar -czf packed_artifacts.tar.gz __packed__/ 2>/dev/null || true
+rm -rf __packed__ || true
+
+# Copy everything back
+cp -r "$SCRATCH/"* "{{ jobdir }}/"
+
+exit 0

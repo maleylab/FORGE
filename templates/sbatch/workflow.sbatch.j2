@@ -1,0 +1,101 @@
+#!/bin/bash
+#SBATCH --job-name={{ job_name }}
+#SBATCH --time={{ time }}
+#SBATCH --cpus-per-task={{ cpus }}
+#SBATCH --mem={{ mem }}
+#SBATCH --output=slurm-%j.out
+#SBATCH --error=slurm-%j.err
+#SBATCH --chdir={{ jobdir }}
+
+# ------------------------------------------------------------
+# Load ORCA (Compute Canada)
+# ------------------------------------------------------------
+if command -v module >/dev/null 2>&1; then
+    module load orca/6.1
+fi
+
+echo "Using ORCA from: $EBROOTORCA"
+echo "Python interpreter: $(which python)"
+
+# ------------------------------------------------------------
+# Prepare local scratch
+# ------------------------------------------------------------
+SCRATCH="${SLURM_TMPDIR}/forge_workflow"
+mkdir -p "$SCRATCH"
+
+echo "Staging job to scratch: $SCRATCH"
+
+# Copy entire job directory to scratch
+rsync -av --exclude="__packed__" --exclude=".forge" "{{ jobdir }}/" "$SCRATCH/"
+
+cd "$SCRATCH" || { echo 'ERROR: failed to cd into scratch'; exit 1; }
+
+echo "Entered scratch directory:"
+pwd
+
+# ------------------------------------------------------------
+# Run FORGE workflow
+# ------------------------------------------------------------
+python3 - << 'EOF'
+from pathlib import Path
+from labtools.workflow.worker_cmd import workflow_entrypoint
+workflow_entrypoint(Path("."))
+EOF
+
+STATUS=$?
+echo "Workflow engine exited with code: $STATUS"
+
+# ------------------------------------------------------------
+# Pack heavy ORCA artifacts only
+# ------------------------------------------------------------
+# ------------------------------------------------------------
+# Pack ORCA & workflow artifacts (clean + deterministic)
+# ------------------------------------------------------------
+echo "Packing ORCA artifacts..."
+
+PACK_DIR="__packed__"
+mkdir -p "$PACK_DIR"
+
+# Copy ONLY heavy artifacts from each stage
+for stage in */ ; do
+    stage="${stage%/}"
+
+    # Skip non-stage directories
+    if [[ "$stage" == "__packed__" || "$stage" == ".forge" ]]; then
+        continue
+    fi
+
+    # Stage artifact directory
+    mkdir -p "$PACK_DIR/$stage"
+
+    # Copy heavy ORCA artifacts
+    find "$stage" -maxdepth 1 -type f \( \
+        -name '*.gbw'      -o \
+        -name '*.engrad'   -o \
+        -name '*.trj'      -o \
+        -name '*.densities' -o \
+        -name '*.densitiesinfo' -o \
+        -name '*.property.txt' -o \
+        -name '*.xyz'      -o \
+        -name '*.opt'      \
+    \) -exec cp {} "$PACK_DIR/$stage/" \;
+
+    # CLEAN the stage directory
+    find "$stage" -maxdepth 1 -type f ! -name 'final.xyz' ! -name '*.inp' ! -name 'output.out' -delete
+done
+
+# Create tarball
+TARBALL="packed_${SLURM_JOB_ID}.tar.gz"
+tar -czf "$TARBALL" "$PACK_DIR"
+
+
+# ------------------------------------------------------------
+# Sync back to original job directory
+# ------------------------------------------------------------
+echo "Syncing results back to {{ jobdir }} ..."
+
+rm -rf "$SCRATCH/__packed__"
+rsync -av "$SCRATCH/" "{{ jobdir }}/"
+
+echo "Done. Scratch will be auto-cleaned."
+exit $STATUS

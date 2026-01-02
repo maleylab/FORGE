@@ -1,5 +1,30 @@
-%maxcore {{ maxcore|default(4000) }}
-! {{ method|default('M06') }} {{ basis_main|default('def2-SVP') }} {{ 'RIJCOSX' if ri|default(true) else '' }} PAL{{ pal|default(8) }} {{ aux_coulomb|default('Def2/J') }} {{ aux_density|default('def2-SVP/C') }} TightSCF
-* xyz {{ charge }} 3
-{{ geometry_block | trim }}
+! {{ method }}{% if basis is defined and basis %} {{ basis }}{% endif %} {{ flags | join(' ') }} {{ restart_flags | join(' ') }}
+
+{% if pal is defined%}
+%pal
+nprocs {{ pal }}
+end
+{% endif %}
+
+{% if maxcore_mb is defined %}
+%maxcore {{ maxcore_mb }}
+{% endif %}
+
+{% if scf is defined and scf %}
+%scf
+{% for key, val in scf.items() %}
+  {{ key }} {{ val }}
+{% endfor %}
+end
+{% endif %}
+
+{% if cpcm %}
+%cpcm
+  epsilon {{ cpcm.epsilon }}
+  {% if cpcm.refrac %} refrac {{ cpcm.refrac }} {% endif %}
+end
+{% endif %}
+
+* xyz {{ charge }} {{ mult }}
+{{ xyz_lines | join("\n") }}
 *
