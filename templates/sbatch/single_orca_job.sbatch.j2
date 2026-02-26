@@ -1,0 +1,202 @@
+#!/bin/bash
+#SBATCH --job-name={{ job_name }}
+#SBATCH --time={{ time }}
+#SBATCH --ntasks={{ nprocs }}
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu={{ mem_per_cpu }}
+#SBATCH --account=def-smaley
+
+set -euo pipefail
+IFS=$'\n\t'
+
+export OMP_NUM_THREADS=1
+ulimit -s unlimited
+
+module purge >/dev/null 2>&1 || true
+module load orca/6.1.0
+
+ORCA_BIN="${EBROOTORCA}/orca"
+if [[ ! -x "$ORCA_BIN" ]]; then
+    echo "[DRONE] ERROR: ORCA not found at ${EBROOTORCA}/orca" >&2
+    exit 2
+fi
+
+SRC_DIR="{{ SRC_DIR }}"
+INP_BN="{{ inp_basename }}"
+if [[ -z "${SRC_DIR}" || -z "${INP_BN}" ]]; then echo "[ERR] SRC_DIR or inp_basename missing"; exit 2; fi
+if [[ "${SRC_DIR}" == "/" ]]; then echo "[ERR] Refusing to stage from /"; exit 2; fi
+if [[ ! -f "${SRC_DIR}/${INP_BN}" ]]; then echo "[ERR] Input not found: ${SRC_DIR}/${INP_BN}"; exit 2; fi
+
+# ------------------------------------------------------------------
+# HEARTBEAT (WATCH ARTIFACTS)
+# ------------------------------------------------------------------
+HEARTBEAT_SECS={{ HEARTBEAT_SECS|default(60) }}
+TAIL_LINES={{ TAIL_LINES|default(200) }}
+
+emit_heartbeat() {
+  local stage="$1"
+  local out_file="$2"
+
+  local ts host jid aidx outsz
+  ts="$(date -Is)"
+  host="$(hostname)"
+  jid="${SLURM_JOB_ID:-}"
+  aidx="${SLURM_ARRAY_TASK_ID:-}"
+  outsz=""
+  if [[ -n "${out_file}" && -f "${out_file}" ]]; then
+    outsz="$(wc -c < "${out_file}" 2>/dev/null || true)"
+  fi
+
+  # Tail -> atomic
+  if [[ -n "${out_file}" && -f "${out_file}" ]]; then
+    tail -n "${TAIL_LINES}" "${out_file}" > "${SRC_DIR}/.job.out.tail.tmp" 2>/dev/null || true
+    mv -f "${SRC_DIR}/.job.out.tail.tmp" "${SRC_DIR}/.job.out.tail" 2>/dev/null || true
+  fi
+
+  # JSON -> atomic
+  {
+    printf '{'
+    printf '"ts":"%s",' "${ts}"
+    printf '"host":"%s",' "${host}"
+    printf '"slurm_job_id":"%s",' "${jid}"
+    printf '"slurm_array_task_id":"%s",' "${aidx}"
+    printf '"job_name":"%s",' "${SLURM_JOB_NAME:-{{ job_name }}}"
+    printf '"src_dir":"%s",' "${SRC_DIR}"
+    printf '"stage":"%s",' "${stage}"
+    if [[ -n "${out_file}" ]]; then
+      printf '"out_file":"%s",' "${out_file}"
+    else
+      printf '"out_file":null,'
+    fi
+    if [[ -n "${outsz}" ]]; then
+      printf '"out_size_bytes":%s' "${outsz}"
+    else
+      printf '"out_size_bytes":null'
+    fi
+    printf '}\n'
+  } > "${SRC_DIR}/watch.json.tmp" 2>/dev/null || true
+  mv -f "${SRC_DIR}/watch.json.tmp" "${SRC_DIR}/watch.json" 2>/dev/null || true
+}
+
+start_heartbeat() {
+  local stage="$1"
+  local out_file="$2"
+  local orca_pid="$3"
+
+  (
+    while kill -0 "${orca_pid}" 2>/dev/null; do
+      emit_heartbeat "${stage}" "${out_file}"
+      sleep "${HEARTBEAT_SECS}" || true
+    done
+    emit_heartbeat "finished" "${out_file}" || true
+  ) &
+  echo $!
+}
+
+choose_scratch() {
+  local jid="${SLURM_JOB_ID:-$$}"
+  local aidx="${SLURM_ARRAY_TASK_ID:-}"
+  local tag="$jid${aidx:+.$aidx}"
+  for d in "${SLURM_TMPDIR:-}" "/scratch/${USER}/${tag}" "/localscratch/${tag}" "/local/${USER}/${tag}" "/tmp/${USER}/${tag}"; do
+    [[ -n "$d" ]] || continue
+    mkdir -p "$d" 2>/dev/null || true
+    [[ -d "$d" && -w "$d" ]] && { echo "$d"; return; }
+  done
+  mktemp -d "/tmp/${USER}/job.${jid}.XXXXXX"
+}
+
+WORKROOT="$(choose_scratch)"
+WORKDIR="${WORKROOT}/job"
+mkdir -p "${WORKDIR}"
+
+echo "[$(date -Is)] Node: $(hostname)"
+echo "[$(date -Is)] Source dir: ${SRC_DIR}"
+echo "[$(date -Is)] Work dir: ${WORKDIR}"
+
+# Stage input + optional auxiliaries (e.g., starting .gbw)
+shopt -s nullglob
+FILES=( "${SRC_DIR}/${INP_BN}" )
+EXTRAS=( {% for g in RSYNC_GLOBS|default(["*bib*", "*.engrad", "*.densi*", "*.gbw","*.hess","*.aux","*.molden.input","*.pcmo"]) %}"{{ g }}"{% if not loop.last %} {% endif %}{% endfor %} )
+for g in "${EXTRAS[@]}"; do
+  for f in "${SRC_DIR}/$g"; do
+    [[ -f "$f" ]] && FILES+=( "$f" )
+  done
+done
+if [[ -z "${FILES[*]:-}" ]]; then
+  echo "[ERR] Nothing to stage"; exit 2
+fi
+rsync -a --ignore-missing-args --protect-args -- "${FILES[@]}" "${WORKDIR}/"
+cd "${WORKDIR}"
+
+# Start state heartbeat before ORCA begins
+emit_heartbeat "staged" ""
+
+echo "[$(date -Is)] Running: {{ orca_cmd }}"
+
+# Run ORCA in background so heartbeat can run concurrently
+( {{ orca_cmd }} ) &
+orca_pid=$!
+
+# Determine expected output file for tailing (best-effort)
+OUT_BN="{{ out_basename | default('job.out') }}"
+# If template doesn't pass out_basename, fall back to job.out
+out_file="${WORKDIR}/${OUT_BN}"
+
+hb_pid="$(start_heartbeat "running" "${out_file}" "${orca_pid}")"
+
+wait "${orca_pid}" || true
+
+# Stop heartbeat loop
+if [[ -n "${hb_pid}" ]]; then
+  kill "${hb_pid}" 2>/dev/null || true
+  wait "${hb_pid}" 2>/dev/null || true
+fi
+
+# Final heartbeat after ORCA ends
+emit_heartbeat "post_orca" "${out_file}"
+
+# ---- Pack heavy artifacts ----------------------------------------------------
+PACK_DIR="__packed__"
+mkdir -p "${PACK_DIR}"
+
+# What to pack (heavies). Add/adjust globs here if needed.
+PACK_GLOBS=( {% for g in PACK_GLOBS|default(["*bib*", "*.densities", "*.densitiesinfo", "*.gbw", "*.property.txt", "*.hess", "*.engrad", "*.aux", "*.molden.input", "*.pcmo"]) %}"{{ g }}"{% if not loop.last %} {% endif %}{% endfor %} )
+
+moved_any=0
+for g in "${PACK_GLOBS[@]}"; do
+  for f in $g; do
+    [[ -f "$f" ]] || continue
+    case "$f" in
+      # keep these at top-level
+      *.inp|*.out|*.xyz|slurm-*.out|*.tar.gz) continue ;;
+    esac
+    mv -f -- "$f" "${PACK_DIR}/" && moved_any=1
+  done
+done
+
+# Compute archive name
+ARCHIVE="{{ ARCHIVE_NAME | default('') }}"
+if [[ -z "${ARCHIVE}" ]]; then
+  ARCHIVE="${SLURM_JOB_NAME:-{{ job_name }}}_${SLURM_JOB_ID:-$$}.tar.gz"
+fi
+
+if [[ "${moved_any}" -eq 1 ]]; then
+  echo "[$(date -Is)] Creating archive: ${ARCHIVE}"
+  tar -czf "${ARCHIVE}" "${PACK_DIR}"
+  rm -rf "${PACK_DIR}"
+else
+  echo "[$(date -Is)] Nothing to pack into ${PACK_DIR}"
+fi
+
+# Keep essentials at top-level: .inp/.out/.xyz/slurm logs + archive
+# (We already avoided moving those above.)
+
+# Final heartbeat before syncing results (so watch sees "syncing")
+emit_heartbeat "syncing" "${out_file}"
+
+echo "[$(date -Is)] Syncing results → ${SRC_DIR}"
+rsync -a --protect-args -- "${WORKDIR}/" "${SRC_DIR}/"
+
+emit_heartbeat "done" "${out_file}"
+
+echo "[$(date -Is)] Done."

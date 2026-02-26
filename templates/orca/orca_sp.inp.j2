@@ -1,6 +1,30 @@
-! SP M06 def2-SVP Def2/J RIJCOSX PAL{{ cpus | default(8) }} NoFinalGrid
-* xyz {{ charge | default(0) }} {{ mult | default(1) }}
-{% for atom in atoms -%}
-{{ "%-2s %10.6f %10.6f %10.6f"|format(atom.symbol, atom.x, atom.y, atom.z) }}
-{% endfor -%}
+! {{ method }}{% if basis is defined and basis %} {{ basis }}{% endif %} {{ flags | join(' ') }} {{ restart_flags | join(' ') }}
+
+{% if maxcore_mb is defined %}
+%maxcore {{ maxcore_mb }}
+{% endif %}
+
+{% if pal is defined%}
+%pal
+nprocs {{ pal }}
+end
+{% endif %}
+
+{% if scf is defined and scf %}
+%scf
+{% for key, val in scf.items() %}
+  {{ key }} {{ val }}
+{% endfor %}
+end
+{% endif %}
+
+{% if cpcm %}
+%cpcm
+  epsilon {{ cpcm.epsilon }}
+  {% if cpcm.refrac %} refrac {{ cpcm.refrac }} {% endif %}
+end
+{% endif %}
+
+* xyz {{ charge }} {{ mult }}
+{{ geom_lines | join("\n") }}
 *

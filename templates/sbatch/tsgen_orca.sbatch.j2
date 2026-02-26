@@ -1,0 +1,32 @@
+#!/bin/bash
+#SBATCH --job-name={{ job_name }}
+#SBATCH --nodes=1
+#SBATCH --ntasks={{ nprocs }}
+#SBATCH --cpus-per-task=1
+#SBATCH --time={{ time }}
+#SBATCH --mem-per-cpu={{ mem_per_cpu }}
+#SBATCH --account=def-smaley
+
+set -euo pipefail
+
+module purge
+module load orca/6.1.0
+
+export OMP_NUM_THREADS={{ nprocs }}
+
+SCRATCH="$SLURM_TMPDIR/{{ job_name }}"
+mkdir -p "$SCRATCH"
+
+cp "{{ inp_path }}" "$SCRATCH/"
+cd "$SCRATCH"
+
+${EBROOTORCA}/orca "{{ inp_basename }}" > "{{ out_basename }}"
+
+mkdir -p __packed__
+mv *.gbw *.densities *.wfn *.wfx *.molden* __packed__/ 2>/dev/null || true
+tar -czf packed_artifacts.tar.gz __packed__/ 2>/dev/null || true
+rm -rf __packed__/ || true
+
+cp -r "$SCRATCH/"* "{{ jobdir }}/"
+
+exit 0

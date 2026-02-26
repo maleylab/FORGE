@@ -1,0 +1,46 @@
+! tightopt {{ method }}{% if basis is defined and basis %} {{ basis }}{% endif %}{{ flags | join(' ') }} {{ restart_flags | join(' ') }}
+
+{% if pal is defined%}
+%pal
+nprocs {{ pal }}
+end
+{% endif %}
+
+{% if maxcore_mb is defined %}
+%maxcore {{ maxcore_mb }}
+{% endif %}
+
+{% if scf is defined and scf %}
+%scf
+{% for key, val in scf.items() %}
+  {{ key }} {{ val }}
+{% endfor %}
+end
+{% endif %}
+
+%geom
+  MaxIter {{ geom.maxiter | default(200) }}
+
+  {% if geom.constraints %}
+  Constraints
+  {% for line in geom.constraints %}
+    {{ line }}
+  {% endfor %}
+  end
+  {% endif %}
+
+  {% if geom.Restart or geom.restart %}
+  Restart true
+  {% endif %}
+end
+
+{% if cpcm %}
+%cpcm
+  epsilon {{ cpcm.epsilon }}
+  {% if cpcm.refrac %} refrac {{ cpcm.refrac }} {% endif %}
+end
+{% endif %}
+
+* xyz {{ charge }} {{ mult }}
+{{ geom_lines | join("\n") }}
+*

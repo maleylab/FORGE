@@ -1,0 +1,59 @@
+version: "1"
+delimiter: ";"
+# Filenames if you emit per-job debug files; otherwise combine builds plan.yaml
+id_pattern: "{{ job.id | default('job') }}"
+columns:
+  - name: id
+    path: jobs[].id
+    type: str
+    transform: strip
+
+  - name: type
+    path: jobs[].type
+    type: str
+    enum: ["optfreq","sp","sp_triplet","nmr"]
+
+  - name: structure
+    path: jobs[].structure
+    type: str
+
+  - name: charge
+    path: jobs[].charge
+    type: int
+
+  - name: mult
+    path: jobs[].mult
+    type: int
+    default: 1
+
+  - name: template
+    path: jobs[].template
+    type: str
+
+  - name: depends_on
+    path: jobs[].depends_on
+    type: list
+    fanout: false
+
+  - name: functional
+    path: jobs[].parameters.functional
+    type: list
+    fanout: true
+
+  - name: basis
+    path: jobs[].parameters.basis
+    type: str
+    default: "Def2-SVP"
+
+  - name: grid
+    path: jobs[].parameters.grid
+    type: list
+    fanout: true
+
+  - name: extras
+    path: jobs[].parameters.extras
+    type: json
+
+computed:
+  - path: version
+    expr: "'1'"

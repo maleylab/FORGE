@@ -1,0 +1,34 @@
+id: da_testing
+version: 1
+
+# Atom indices defining the DA reaction core
+# (adjust if needed, but these must match TS atom numbering)
+atom_indices:
+  - 0
+  - 1
+  - 12
+  - 13
+
+# Reference TS imaginary mode (flattened, normalized)
+vector:
+  - -0.3895679578055072
+  - -0.0944269897725189
+  - -0.0357879961237666
+  - -0.3594889610633932
+  -  0.1250779864526789
+  - -0.1262219863287712
+  - -0.0833909909678389
+  -  0.0213089976920013
+  - -0.0461789949983071
+  -  0.4152539550234313
+  -  0.0712999922774269
+  -  0.0419529954560294
+
+expected:
+  n_imag: 1
+  imag_cm1_min: -800.0
+  imag_cm1_max: -100.0
+
+thresholds:
+  min_cosine: 0.85
+  min_localization: 0.6

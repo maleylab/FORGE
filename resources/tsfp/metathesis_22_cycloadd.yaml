@@ -1,0 +1,40 @@
+id: metathesis_22_cycloadd 
+version: 1
+
+# Atom indices corresponding to the imaginary-mode vector blocks
+# Order MUST match the vector blocks below
+atom_indices:
+  - 0
+  - 10
+  - 13
+  - 7
+
+# Flattened imaginary-mode vector (4 atoms × 3 components)
+vector:
+  - 0.0156519952655226
+  - 0.0173649947473677
+  - -0.0039849987946018
+
+  - -0.0784409762728633
+  - 0.0611269815100689
+  - 0.0258999921656680
+
+  - -0.1086749671275662
+  - 0.0646809804350413
+  - 0.0508459846199055
+
+  - 0.0336119898329124
+  - -0.2252579318630900
+  - -0.0106639967743121
+
+# Imaginary-mode sanity bounds (optional but recommended)
+expected:
+  n_imag: 1
+  imag_cm1_min: -800.0
+  imag_cm1_max: -100.0
+
+# Verification thresholds
+thresholds:
+  min_cosine: 0.85
+  min_localization: 0.60
+

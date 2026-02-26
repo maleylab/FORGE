@@ -1,0 +1,79 @@
+#!/bin/bash
+#SBATCH --job-name={{ job_name }}
+#SBATCH --account={{ account | default("def-smaley") }}
+#SBATCH --nodes=1
+#SBATCH --ntasks={{ nprocs }}
+#SBATCH --cpus-per-task=1
+#SBATCH --time={{ time | default("08:00:00") }}
+#SBATCH --mem-per-cpu={{ mem_per_cpu | default("4G") }}
+#SBATCH --output=%x_%j.out
+#SBATCH --error=%x_%j.err
+#SBATCH --chdir={{ jobdir }}
+#SBATCH --export=ALL
+
+set -euo pipefail
+
+module purge >/dev/null 2>&1 || true
+module load orca/6.1.0
+
+ORCA_BIN="${EBROOTORCA}/orca"
+if [[ ! -x "$ORCA_BIN" ]]; then
+    echo "[TSGEN-L3] ERROR: ORCA binary not found" >&2
+    exit 2
+fi
+
+export OMP_NUM_THREADS={{ nprocs }}
+ulimit -s unlimited
+
+echo "[TSGEN-L3] Running single-point in {{ jobdir }}"
+
+# --------------------------------------------------
+# Prepare scratch
+# --------------------------------------------------
+SCRATCH="$SLURM_TMPDIR/{{ job_name }}"
+mkdir -p "$SCRATCH"
+
+cp -r . "$SCRATCH/"
+cd "$SCRATCH"
+
+# --------------------------------------------------
+# Run ORCA (single-shot)
+# --------------------------------------------------
+inp=$(ls *.inp | head -n 1)
+if [[ -z "$inp" ]]; then
+    echo "[TSGEN-L3] ERROR: No .inp file found" >&2
+    exit 1
+fi
+
+echo "[TSGEN-L3] Running ORCA: $inp"
+"$ORCA_BIN" "$inp" > "${inp%.inp}.out" 2>&1 || true
+
+# --------------------------------------------------
+# Package heavy artifacts
+# --------------------------------------------------
+mkdir -p __packed__
+mv *.gbw *.densities *.hess *.engrad __packed__/ 2>/dev/null || true
+
+if compgen -G "__packed__/*" >/dev/null; then
+    tar czf __packed__.tar.gz __packed__
+fi
+
+# --------------------------------------------------
+# Copy results back
+# --------------------------------------------------
+cd "{{ jobdir }}"
+
+cp "$SCRATCH"/*.out . 2>/dev/null || true
+cp "$SCRATCH"/*.xyz . 2>/dev/null || true
+cp "$SCRATCH"/__packed__.tar.gz . 2>/dev/null || true
+
+# --------------------------------------------------
+# Mark completion
+# --------------------------------------------------
+if ls *.out >/dev/null 2>&1; then
+    touch DONE
+    echo "[TSGEN-L3] Completed successfully"
+else
+    touch FAIL
+    echo "[TSGEN-L3] FAILED"
+fi

@@ -1,0 +1,21 @@
+#!/bin/bash
+#SBATCH --job-name={{ job_name }}
+#SBATCH --time={{ time }}
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4G
+#SBATCH --output=controller.out
+#SBATCH --error=controller.err
+
+# Activate venv if the user relies on one
+if [ -n "$VIRTUAL_ENV" ]; then
+    echo "[controller] Using existing venv: $VIRTUAL_ENV"
+else
+    if [ -f "$HOME/venvs/forge/bin/activate" ]; then
+        echo "[controller] Activating $HOME/venvs/forge"
+        source "$HOME/venvs/forge/bin/activate"
+    fi
+fi
+
+echo "[controller] Starting TSGen controller at {{ root }}"
+
+labtools tsgen-run-control "{{ root }}"

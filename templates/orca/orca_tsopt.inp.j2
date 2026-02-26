@@ -1,0 +1,53 @@
+{# --- Bang line --- #}
+! {{ method }}{% if basis is defined and basis %} {{ basis }}{% endif %}{% if grid is defined and grid %} {{ grid }}{% endif %} OptTS freq RIJCOSX{% if flags %} {{ flags | join(' ') }}{% endif %}{% if restart_flags %} {{ restart_flags | join(' ') }}{% endif %}
+
+{% if pal is defined %}
+%pal
+nprocs {{ pal }}
+end
+{% endif %}
+
+{# --- Maxcore: always present, default 2000 MB --- #}
+%maxcore {{ maxcore_mb | default(2000) }}
+
+{% if scf is defined and scf %}
+%scf
+{% for key, val in scf.items() %}
+  {{ key }} {{ val }}
+{% endfor %}
+end
+{% endif %}
+
+{# --- Geom (TS opt): MaxIter + constraints + restart + optional overrides --- #}
+%geom
+ {% if geom.constraints %}
+  Constraints
+{% for line in geom.constraints %}
+    {{ line }}
+{% endfor %}
+  end
+{% endif %}
+
+{% if geom.restart %}
+  Restart true
+{% endif %}
+
+{# Generic hook: emit any additional %geom keyword/value pairs #}
+{% if geom.override is defined and geom.override %}
+{% for key, val in geom.override.items() %}
+  {{ key }} {{ val }}
+{% endfor %}
+{% endif %}
+
+end
+
+{% if cpcm %}
+%cpcm
+  epsilon {{ cpcm.epsilon }}
+{% if cpcm.refrac %}  refrac {{ cpcm.refrac }}{% endif %}
+end
+{% endif %}
+
+* xyz {{ charge }} {{ mult }}
+{{ geom_lines | join("\n") }}
+*

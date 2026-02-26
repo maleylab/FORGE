@@ -1,0 +1,1 @@
+{"id":"debug_001","schema":{"name":"debug","version":1},"intent":{"task":"orca","system":"generic"},"parameters":{"charge":0,"multiplicity":1},"metadata":{"tags":["debug"],"notes":"scaffold plan entry"}}

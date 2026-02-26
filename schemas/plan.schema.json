@@ -14,6 +14,7 @@
           "id": {
             "type": "string"
           },
+
           "type": {
             "type": "string",
             "enum": [
@@ -23,28 +24,102 @@
               "nmr"
             ]
           },
+
           "structure": {
             "type": "string"
           },
+
           "charge": {
             "type": "integer"
           },
+
           "mult": {
             "type": "integer"
           },
+
           "template": {
             "type": "string"
           },
+
           "depends_on": {
             "type": "array",
             "items": {
               "type": "string"
             }
           },
+
           "parameters": {
             "type": "object"
+          },
+
+
+          "workflow": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "opt",
+                "freq",
+                "sp",
+                "sp_triplet",
+                "nmr"
+              ]
+            },
+            "description": "Optional explicit list of workflow stages. Overrides default workflow determined from job type."
+          },
+
+
+          "restart": {
+            "type": "object",
+            "properties": {
+              "profile": {
+                "type": "string",
+                "enum": [
+                  "conservative",
+                  "moderate",
+                  "aggressive",
+                  "ts_strict"
+                ]
+              },
+              "scf": {
+                "type": "string",
+                "enum": [
+                  "conservative",
+                  "moderate",
+                  "aggressive",
+                  "strict"
+                ]
+              },
+              "geometry": {
+                "type": "string",
+                "enum": [
+                  "conservative",
+                  "moderate",
+                  "aggressive",
+                  "strict"
+                ]
+              },
+              "ts": {
+                "type": "string",
+                "enum": [
+                  "conservative",
+                  "moderate",
+                  "aggressive",
+                  "strict"
+                ]
+              }
+            },
+            "additionalProperties": false,
+            "description": "Restart behavior tuning for SCF, geometry, and TS logic."
+          },
+
+          "max_restarts": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Maximum number of restart attempts allowed before marking stage as FAIL."
           }
         },
+
         "required": [
           "id",
           "type",
@@ -54,6 +129,7 @@
       }
     }
   },
+
   "required": [
     "version",
     "jobs"

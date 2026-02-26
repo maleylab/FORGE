@@ -1,0 +1,36 @@
+! {{ method }} {{ basis }} {{ flags | join(' ') }} {{ restart_flags | join(' ') }}
+
+%maxcore {{ maxcore_mb }}
+
+%geom
+  TS true
+  MaxIter {{ geom.maxiter | default(200) }}
+
+  {% if geom.constraints %}
+  Constraints
+  {% for line in geom.constraints %}
+    {{ line }}
+  {% endfor %}
+  end
+  {% endif %}
+
+  {% if geom.restart %}
+  Restart true
+  {% endif %}
+end
+
+%scf
+{% for key, val in scf.items() %}
+  {{ key }} {{ val }}
+{% endfor %}
+end
+
+{% if cpcm %}
+%cpcm
+  epsilon {{ cpcm.epsilon }}
+end
+{% endif %}
+
+* xyz {{ charge }} {{ mult }}
+{{ xyz_lines | join("\n") }}
+*

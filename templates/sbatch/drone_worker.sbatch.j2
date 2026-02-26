@@ -1,0 +1,340 @@
+#!/bin/bash
+#SBATCH --job-name={{ job_name }}
+#SBATCH --account=def-smaley
+#SBATCH --nodes=1
+#SBATCH --ntasks={{ nprocs }}
+#SBATCH --cpus-per-task=1
+#SBATCH --time={{ time }}
+#SBATCH --mem-per-cpu={{ mem_per_cpu }}
+#SBATCH --output={{ QUEUE_DIR }}/logs/%x_%j.out
+#SBATCH --error={{ QUEUE_DIR }}/logs/%x_%j.err
+#SBATCH --chdir={{ QUEUE_DIR }}
+#SBATCH --export=ALL
+
+# ------------------------------------------------------------------
+# STRICT MODE
+# ------------------------------------------------------------------
+set -euo pipefail
+IFS=$'\n\t'
+
+# ------------------------------------------------------------------
+# ENVIRONMENT
+# ------------------------------------------------------------------
+module purge >/dev/null 2>&1 || true
+module load orca/6.1.0
+
+ORCA_BIN="${EBROOTORCA}/orca"
+if [[ ! -x "$ORCA_BIN" ]]; then
+    echo "[DRONE] ERROR: ORCA not found at ${EBROOTORCA}/orca" >&2
+    exit 2
+fi
+
+export OMP_NUM_THREADS=1
+ulimit -s unlimited
+
+QUEUE_ROOT="{{ QUEUE_DIR }}"
+SLEEP_SECS={{ SLEEP_SECS }}
+
+mkdir -p "${QUEUE_ROOT}/logs"
+
+# ------------------------------------------------------------------
+# WORKER LIFETIME CONTROL (IDLE EXIT)
+# ------------------------------------------------------------------
+# Exit after N consecutive idle cycles with no READY jobs.
+# Set MAX_IDLE_CYCLES=0 to run indefinitely.
+MAX_IDLE_CYCLES={{ MAX_IDLE_CYCLES|default(5) }}
+idle_cycles=0
+
+# ------------------------------------------------------------------
+# WORKER SAFETY (WALLTIME MARGIN)
+# ------------------------------------------------------------------
+# If remaining walltime is below this margin, exit cleanly *without claiming new jobs*.
+SAFETY_MARGIN_SECS={{ SAFETY_MARGIN_SECS|default(900) }}   # default 15 min
+
+# ------------------------------------------------------------------
+# HERD DE-SYNCHRONIZATION (JITTER)
+# ------------------------------------------------------------------
+# Random startup jitter reduces thundering-herd claims when many workers start together.
+JITTER_MAX_SECS={{ JITTER_MAX_SECS|default(60) }}
+
+# Random idle jitter prevents lockstep polling when queue is empty.
+IDLE_JITTER_MAX_SECS={{ IDLE_JITTER_MAX_SECS|default(10) }}
+
+# ------------------------------------------------------------------
+# HEARTBEAT (WATCH ARTIFACTS)
+# ------------------------------------------------------------------
+# Emit watch.json + .job.out.tail back to the job directory while ORCA runs.
+HEARTBEAT_SECS={{ HEARTBEAT_SECS|default(60) }}
+TAIL_LINES={{ TAIL_LINES|default(200) }}
+
+echo "[DRONE] Worker starting"
+echo "[DRONE] Queue root: ${QUEUE_ROOT}"
+echo "[DRONE] Sleep interval: ${SLEEP_SECS}s"
+echo "[DRONE] Max idle cycles: ${MAX_IDLE_CYCLES}"
+echo "[DRONE] Safety margin: ${SAFETY_MARGIN_SECS}s"
+echo "[DRONE] Startup jitter max: ${JITTER_MAX_SECS}s"
+echo "[DRONE] Idle jitter max: ${IDLE_JITTER_MAX_SECS}s"
+echo "[DRONE] Heartbeat interval: ${HEARTBEAT_SECS}s"
+echo "[DRONE] Tail lines: ${TAIL_LINES}"
+
+# ------------------------------------------------------------------
+# SAFETY: ALWAYS RETURN TO QUEUE ROOT
+# ------------------------------------------------------------------
+cd "${QUEUE_ROOT}"
+
+cleanup() {
+    cd "${QUEUE_ROOT}" || true
+}
+trap cleanup EXIT
+
+# ------------------------------------------------------------------
+# ONE-TIME STARTUP JITTER
+# ------------------------------------------------------------------
+if [[ "${JITTER_MAX_SECS}" -gt 0 ]]; then
+    jitter=$(( RANDOM % (JITTER_MAX_SECS + 1) ))
+    echo "[DRONE] Startup jitter: sleeping ${jitter}s"
+    sleep "${jitter}"
+fi
+
+# ------------------------------------------------------------------
+# TIME-LEFT HELPER (best-effort)
+# ------------------------------------------------------------------
+time_left_secs() {
+    # Prefer SLURM_TIME_LEFT if present (format: HH:MM:SS or MM:SS)
+    if [[ -n "${SLURM_TIME_LEFT:-}" ]]; then
+        awk -F: '
+            NF==3 { print ($1*3600)+($2*60)+$3; exit }
+            NF==2 { print ($1*60)+$2; exit }
+            NF==1 { print $1; exit }
+        ' <<< "${SLURM_TIME_LEFT}"
+        return 0
+    fi
+
+    # Fallback: scontrol (format includes TimeLeft=HH:MM:SS)
+    if command -v scontrol >/dev/null 2>&1 && [[ -n "${SLURM_JOB_ID:-}" ]]; then
+        scontrol show job "${SLURM_JOB_ID}" 2>/dev/null \
+          | awk -F= '/TimeLeft=/{print $2; exit}' \
+          | awk -F: '
+                NF==3 { print ($1*3600)+($2*60)+$3; exit }
+                NF==2 { print ($1*60)+$2; exit }
+                NF==1 { print $1; exit }
+            '
+        return 0
+    fi
+
+    # Unknown
+    echo 0
+    return 0
+}
+
+# ------------------------------------------------------------------
+# HEARTBEAT EMITTER (atomic writes)
+# ------------------------------------------------------------------
+emit_heartbeat() {
+    local job_src="$1"      # queue job directory (lustre)
+    local workdir="$2"      # scratch job directory
+    local out_file="$3"     # scratch output file
+
+    local ts host jid aidx outsz
+    ts="$(date -Is)"
+    host="$(hostname)"
+    jid="${SLURM_JOB_ID:-}"
+    aidx="${SLURM_ARRAY_TASK_ID:-}"
+    outsz=""
+    if [[ -f "${workdir}/${out_file}" ]]; then
+        outsz="$(wc -c < "${workdir}/${out_file}" 2>/dev/null || true)"
+    fi
+
+    # Tail (best effort): write tmp then rename
+    if [[ -f "${workdir}/${out_file}" ]]; then
+        tail -n "${TAIL_LINES}" "${workdir}/${out_file}" > "${job_src}/.job.out.tail.tmp" 2>/dev/null || true
+        mv -f "${job_src}/.job.out.tail.tmp" "${job_src}/.job.out.tail" 2>/dev/null || true
+    fi
+
+    # JSON (best effort): write tmp then rename
+    {
+        printf '{'
+        printf '"ts":"%s",' "${ts}"
+        printf '"host":"%s",' "${host}"
+        printf '"slurm_job_id":"%s",' "${jid}"
+        printf '"slurm_array_task_id":"%s",' "${aidx}"
+        printf '"worker":"%s",' "${SLURM_JOB_NAME:-worker}"
+        printf '"job_dir":"%s",' "${job_src}"
+        printf '"stage":"%s",' "running"
+        printf '"out_file":"%s",' "${out_file}"
+        if [[ -n "${outsz}" ]]; then
+            printf '"out_size_bytes":%s' "${outsz}"
+        else
+            printf '"out_size_bytes":null'
+        fi
+        printf '}\n'
+    } > "${job_src}/watch.json.tmp" 2>/dev/null || true
+    mv -f "${job_src}/watch.json.tmp" "${job_src}/watch.json" 2>/dev/null || true
+}
+
+start_heartbeat() {
+    local job_src="$1"
+    local workdir="$2"
+    local out_file="$3"
+    local orca_pid="$4"
+
+    (
+        while kill -0 "${orca_pid}" 2>/dev/null; do
+            emit_heartbeat "${job_src}" "${workdir}" "${out_file}"
+            sleep "${HEARTBEAT_SECS}" || true
+        done
+        # final heartbeat after ORCA ends (best-effort)
+        emit_heartbeat "${job_src}" "${workdir}" "${out_file}" || true
+    ) &
+    echo $!
+}
+
+# ------------------------------------------------------------------
+# MAIN WORKER LOOP
+# ------------------------------------------------------------------
+while true; do
+    cd "${QUEUE_ROOT}"
+
+    # --------------------------------------------------------------
+    # WALLTIME SAFETY GATE (do not claim new work if unsafe)
+    # --------------------------------------------------------------
+    remaining="$(time_left_secs || echo 0)"
+    if (( remaining > 0 && remaining < SAFETY_MARGIN_SECS )); then
+        echo "[DRONE] Remaining walltime ${remaining}s < safety margin ${SAFETY_MARGIN_SECS}s"
+        echo "[DRONE] Exiting without claiming new jobs."
+        exit 0
+    fi
+
+    selected=""
+
+    # Find first READY job directory
+    for jobdir in */; do
+        [[ -d "$jobdir" ]] || continue
+        [[ -f "$jobdir/READY" ]] || continue
+        selected="$jobdir"
+        break
+    done
+
+    if [[ -z "$selected" ]]; then
+        idle_cycles=$((idle_cycles + 1))
+
+        sleep_for="${SLEEP_SECS}"
+        if [[ "${IDLE_JITTER_MAX_SECS}" -gt 0 ]]; then
+            j=$(( RANDOM % (IDLE_JITTER_MAX_SECS + 1) ))
+            sleep_for=$(( SLEEP_SECS + j ))
+        fi
+
+        echo "[DRONE] No READY jobs. Idle cycle ${idle_cycles}/${MAX_IDLE_CYCLES}. Sleeping ${sleep_for}s..."
+
+        if [[ "${MAX_IDLE_CYCLES}" -gt 0 && "${idle_cycles}" -ge "${MAX_IDLE_CYCLES}" ]]; then
+            echo "[DRONE] No work after ${idle_cycles} idle cycles. Exiting cleanly."
+            exit 0
+        fi
+
+        sleep "${sleep_for}"
+        continue
+    fi
+
+    # Reset idle counter when we actually have work
+    idle_cycles=0
+
+    echo "[DRONE] Selected job: ${selected}"
+
+    # -----------
+    # CLAIM JOB
+    # -----------
+    rm -f "${selected}/READY"
+    touch "${selected}/STARTED"
+
+    # ------------------
+    # PREPARE SCRATCH
+    #-------------------
+    SCRATCH="${SLURM_TMPDIR}/${SLURM_JOB_ID}_${selected%/}"
+    mkdir -p "${SCRATCH}"
+
+    echo "[DRONE] Scratch directory: ${SCRATCH}"
+
+    cp -r "${selected}" "${SCRATCH}/"
+
+    # -----------------------
+    # RUN ORCA IN SCRATCH
+    # ----------------------
+    pushd "${SCRATCH}/${selected}" >/dev/null
+
+    inp="$(ls *.inp | head -n 1 || true)"
+    if [[ -z "$inp" ]]; then
+        echo "[DRONE] ERROR: No .inp file found" >&2
+        popd >/dev/null
+        cd "${QUEUE_ROOT}/${selected}"
+        rm -f STARTED
+        touch FAIL
+        continue
+    fi
+
+    out_bn="${inp%.inp}.out"
+    echo "[DRONE] Running ORCA: ${ORCA_BIN} ${inp} > ${out_bn}"
+
+    # Run ORCA in background so heartbeat can run concurrently
+    "${ORCA_BIN}" "${inp}" > "${out_bn}" 2>&1 &
+    orca_pid=$!
+
+    # Start heartbeat (writes into the *queue job dir*)
+    job_src="${QUEUE_ROOT}/${selected%/}"
+    hb_pid="$(start_heartbeat "${job_src}" "$(pwd)" "${out_bn}" "${orca_pid}")"
+
+    # Wait for ORCA to finish
+    wait "${orca_pid}" || true
+
+    # Stop heartbeat
+    if [[ -n "${hb_pid}" ]]; then
+        kill "${hb_pid}" 2>/dev/null || true
+        wait "${hb_pid}" 2>/dev/null || true
+    fi
+
+    # ----------------------------
+    # PACKAGE HEAVY ARTIFACTS
+    # --------------------------
+    mkdir -p __packed__
+    mv *.gbw *.hess *.densities *.engrad __packed__ 2>/dev/null || true
+
+    if compgen -G "__packed__/*" >/dev/null; then
+        tar czf __packed__.tar.gz __packed__
+        rm -rf __packed__
+    else
+        rmdir __packed__ 2>/dev/null || true
+    fi
+
+    popd >/dev/null
+
+    # -------------------------
+    # COPY RESULTS BACK
+    # ----------------------
+    pushd "${QUEUE_ROOT}/${selected}" >/dev/null
+
+    rm -f STARTED
+
+    cp "${SCRATCH}/${selected}"/*.out . 2>/dev/null || true
+    cp "${SCRATCH}/${selected}"/*.xyz . 2>/dev/null || true
+    cp "${SCRATCH}/${selected}"/*.log . 2>/dev/null || true
+    cp "${SCRATCH}/${selected}"/__packed__.tar.gz . 2>/dev/null || true
+
+    # --------------------------------------------------------------
+    # MARK DONE OR FAIL
+    # --------------------------------------------------------------
+    if ls *.out >/dev/null 2>&1; then
+        touch DONE
+        echo "[DRONE] Job completed: ${selected}"
+    else
+        touch FAIL
+        echo "[DRONE] Job FAILED: ${selected}"
+    fi
+
+    popd >/dev/null
+
+    # --------------------------------------------------------------
+    # CLEAN SCRATCH
+    # --------------------------------------------------------------
+    rm -rf "${SCRATCH}"
+
+    sleep 1
+done

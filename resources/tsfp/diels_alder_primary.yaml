@@ -1,0 +1,53 @@
+id: diels_alder_primary
+version: 1
+atom_indices:
+- 0
+- 12
+- 1
+- 9
+atom_map:
+  0: 0
+  12: 12
+  1: 1
+  9: 9
+vector:
+- 0.36380267227445034
+- 0.094181173980014
+- -0.12311378517266355
+- -0.48171466561311255
+- -0.124879520217765
+- 0.15468616436802982
+- 0.4712133127598241
+- -0.1549618027940163
+- -0.15644954352914847
+- -0.5076611938575751
+- 0.10810680420228835
+- 0.17919324749900756
+expected:
+  n_imag: 1
+  imag_cm1_min: -800
+  imag_cm1_max: -100
+thresholds:
+  min_cosine: 0.85
+  min_localization: 0.6
+provenance:
+  ref_method: unknown
+  ref_software: ORCA
+  mass_weighted: true
+  description: DA Transition State
+  source_file: diene-CF3__dienophile-H_endo_tsopt.out
+  mode_index: 6
+  imag_cm1: -485.02
+ref_subset_xyz:
+- - -0.451595
+  - -1.407016
+  - 0.502909
+- - 1.596856
+  - -0.653195
+  - -0.222043
+- - -0.434485
+  - 1.428085
+  - 0.505988
+- - 1.560578
+  - 0.723341
+  - -0.261044

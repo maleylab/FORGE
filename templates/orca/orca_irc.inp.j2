@@ -1,0 +1,36 @@
+! irc {{ method }}{% if basis is defined and basis %} {{ basis }}{% endif %}{% if grid is defined and grid %} {{ grid }}{% endif %}{{ flags | join(' ') }} {{ restart_flags | join(' ') }}
+
+%maxcore {{ maxcore_mb | default(2000, true) }}
+
+{% if pal is defined and pal %}
+%pal
+  nprocs {{ pal }}
+end
+{% endif %}
+
+{% if scf is defined and scf %}
+%scf
+{% for key, val in scf.items() %}
+  {{ key }} {{ val }}
+{% endfor %}
+end
+{% endif %}
+
+{% if cpcm %}
+%cpcm
+  epsilon {{ cpcm.epsilon }}
+  {% if cpcm.refrac %} refrac {{ cpcm.refrac }} {% endif %}
+end
+{% endif %}
+
+{% if irc is defined and irc %}
+%irc
+{% for key, val in irc.items() %}
+  {{ key }} {{ val }}
+{% endfor %}
+end
+{% endif %}
+
+* xyz {{ charge }} {{ mult }}
+{{ geom_lines | join("\n") }}
+*

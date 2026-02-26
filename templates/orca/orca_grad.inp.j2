@@ -1,0 +1,30 @@
+! EnGrad RIJCOSX {{ method }}{% if basis is defined and basis %} {{ basis }}{% endif %}{% if grid is defined and grid %} {{ grid }}{% endif %}{{ flags | join(' ') }} {{ restart_flags | join(' ') }}
+
+{% if maxcore_mb is defined %}
+%maxcore {{ maxcore_mb }}
+{% endif %}
+
+{% if pal is defined %}
+%pal
+nprocs {{ pal }}
+end
+{% endif %}
+
+{% if scf is defined and scf %}
+%scf
+{% for key, val in scf.items() %}
+  {{ key }} {{ val }}
+{% endfor %}
+end
+{% endif %}
+
+{% if cpcm %}
+%cpcm
+  epsilon {{ cpcm.epsilon }}
+  {% if cpcm.refrac %}refrac {{ cpcm.refrac }}{% endif %}
+end
+{% endif %}
+
+* xyz {{ charge }} {{ mult }}
+{{ geom_lines | join("\n") }}
+*

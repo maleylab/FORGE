@@ -1,5 +1,53 @@
-%maxcore {{ maxcore|default(4000) }}
-! {{ method|default('M06') }} {{ basis_main|default('def2-SVP') }} {{ 'RIJCOSX' if ri|default(true) else '' }} PAL{{ pal|default(8) }} {{ aux_coulomb|default('Def2/J') }} {{ aux_density|default('def2-SVP/C') }} TightOpt TightSCF Freq
-* xyz {{ charge }} {{ multiplicity }}
-{{ geometry_block | trim }}
+{# --- Bang line --- #}
+! {{ method }}{% if basis is defined and basis %} {{ basis }}{% endif %} TightOpt Freq RIJCOSX{% if flags %} {{ flags | join(' ') }}{% endif %}{% if restart_flags %} {{ restart_flags | join(' ') }}{% endif %}
+
+{% if pal is defined %}
+%pal
+nprocs {{ pal }}
+end
+{% endif %}
+
+{# --- Maxcore: always present, default 2000 MB --- #}
+%maxcore {{ maxcore_mb | default(2000) }}
+
+{% if scf is defined and scf %}
+%scf
+{% for key, val in scf.items() %}
+  {{ key }} {{ val }}
+{% endfor %}
+end
+{% endif %}
+
+{# --- Geom: no explicit "Opt" line; keep only MaxIter + optional sections --- #}
+%geom
+{% if geom.constraints %}
+  Constraints
+{% for line in geom.constraints %}
+    {{ line }}
+{% endfor %}
+  end
+{% endif %}
+{% if geom.restart %}
+  Restart true
+{% endif %}
+end
+
+{# Only emit %freq if there is actual content. #}
+{% if freq is defined and freq and freq.override %}
+%freq
+{% for key, val in freq.override.items() %}
+  {{ key }} {{ val }}
+{% endfor %}
+end
+{% endif %}
+
+{% if cpcm %}
+%cpcm
+  epsilon {{ cpcm.epsilon }}
+{% if cpcm.refrac %}  refrac {{ cpcm.refrac }}{% endif %}
+end
+{% endif %}
+
+* xyz {{ charge }} {{ mult }}
+{{ geom_lines | join("\n") }}
 *

@@ -1,0 +1,95 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FORGE CSV Mapping",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "delimiter": {
+      "type": "string"
+    },
+    "id_pattern": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "columns": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "path"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "str",
+              "int",
+              "float",
+              "bool",
+              "list",
+              "json"
+            ]
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "default": {},
+          "source": {
+            "type": "string",
+            "enum": [
+              "csv",
+              "default_only"
+            ]
+          },
+          "fanout": {
+            "type": "boolean"
+          },
+          "enum": {
+            "type": "array"
+          },
+          "transform": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "coalesce": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "computed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "expr"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "expr": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

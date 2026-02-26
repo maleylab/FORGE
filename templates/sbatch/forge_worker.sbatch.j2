@@ -1,0 +1,25 @@
+#!/bin/bash
+#SBATCH --job-name={{ job_name }}
+#SBATCH --account=def-smaley
+#SBATCH --time={{ time }}
+#SBATCH --ntasks={{ nprocs }}
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu={{ mem_per_cpu }}
+#SBATCH --output=worker.out
+#SBATCH --error=worker.err
+
+# --- Load ORCA + Python environment ---
+module purge
+module load {{ orca_module }}
+
+source {{ python_venv }}/bin/activate
+
+echo "[FORGE] Worker started on $(hostname)"
+echo "[FORGE] Job directory: {{ jobdir }}"
+
+cd {{ jobdir }}
+
+# --- Run the workflow engine ---
+srun labtools workflow-step {{ jobdir }}
+
+echo "[FORGE] Worker completed."

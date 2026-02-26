@@ -1,0 +1,48 @@
+id: da_transition_state
+version: 1
+atom_indices:
+- 0
+- 12
+- 1
+- 9
+vector:
+- 0.308846
+- 0.079954
+- -0.104516
+- -0.408946
+- -0.106015
+- 0.131319
+- 0.400031
+- -0.131553
+- -0.132816
+- -0.430973
+- 0.091776
+- 0.152124
+expected:
+  n_imag: 1
+  imag_cm1_min: -800
+  imag_cm1_max: -100
+thresholds:
+  min_cosine: 0.8
+  min_localization: 0.7
+provenance:
+  ref_method: unknown
+  ref_software: ORCA
+  mass_weighted: true
+  description: DA Transition State
+  source_file: TS.out
+  mode_index: 6
+  imag_cm1: -485.02
+ref_subset_xyz:
+- - -0.451595
+  - -1.407016
+  - 0.502909
+- - 1.596856
+  - -0.653195
+  - -0.222043
+- - -0.434485
+  - 1.428085
+  - 0.505988
+- - 1.560578
+  - 0.723341
+  - -0.261044
