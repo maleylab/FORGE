@@ -1,8 +1,6 @@
 ! EnGrad RIJCOSX {{ method }}{% if basis is defined and basis %} {{ basis }}{% endif %}{% if grid is defined and grid %} {{ grid }}{% endif %}{{ flags | join(' ') }} {{ restart_flags | join(' ') }}
 
-{% if maxcore_mb is defined %}
-%maxcore {{ maxcore_mb }}
-{% endif %}
+%maxcore 2000
 
 {% if pal is defined %}
 %pal

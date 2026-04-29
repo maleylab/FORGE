@@ -1,5 +1,5 @@
 {# --- Bang line --- #}
-! {{ method }}{% if basis is defined and basis %} {{ basis }}{% endif %} TightOpt Freq RIJCOSX{% if flags %} {{ flags | join(' ') }}{% endif %}{% if restart_flags %} {{ restart_flags | join(' ') }}{% endif %}
+! {{ method }}{% if basis is defined and basis %} {{ basis }}{% endif %}{% if grid is defined and grid %} {{ grid }}{% endif %} OptTS freq RIJCOSX{% if flags %} {{ flags | join(' ') }}{% endif %}{% if restart_flags %} {{ restart_flags | join(' ') }}{% endif %}
 
 {% if pal is defined %}
 %pal
@@ -10,11 +10,6 @@ end
 {# --- Maxcore: always present, default 2000 MB --- #}
 %maxcore {{ maxcore_mb | default(2000) }}
 
-%symmetry
- SymRelaxOpt true
- CleanUpGradient true
-end
-
 {% if scf is defined and scf %}
 %scf
 {% for key, val in scf.items() %}
@@ -23,28 +18,28 @@ end
 end
 {% endif %}
 
-{# --- Geom: no explicit "Opt" line; keep only MaxIter + optional sections --- #}
+{# --- Geom (TS opt): MaxIter + constraints + restart + optional overrides --- #}
 %geom
-{% if geom.constraints %}
+ {% if geom.constraints %}
   Constraints
 {% for line in geom.constraints %}
     {{ line }}
 {% endfor %}
   end
 {% endif %}
+
 {% if geom.restart %}
   Restart true
 {% endif %}
-end
 
-{# Only emit %freq if there is actual content. #}
-{% if freq is defined and freq and freq.override %}
-%freq
-{% for key, val in freq.override.items() %}
+{# Generic hook: emit any additional %geom keyword/value pairs #}
+{% if geom.override is defined and geom.override %}
+{% for key, val in geom.override.items() %}
   {{ key }} {{ val }}
 {% endfor %}
-end
 {% endif %}
+
+end
 
 {% if cpcm %}
 %cpcm

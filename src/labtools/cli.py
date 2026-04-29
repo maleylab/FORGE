@@ -129,6 +129,10 @@ watch_app = typer.Typer(help="Watch jobs (filesystem + scheduler sampler)")
 app.add_typer(watch_app, name="watch")
 
 
+pipeline_app = typer.Typer(help="Artifact-backed pipeline workflows")
+app.add_typer(pipeline_app, name="pipeline")
+
+
 # ==========================================================
 # TS-FP commands (soft-dependency)
 # ==========================================================
@@ -1735,6 +1739,203 @@ def watch_snapshot(
         typer.secho(f"Updated state → {latest}", fg=typer.colors.GREEN)
 
 
+
+# ==========================================================
+# Pipeline commands
+# ==========================================================
+
+
+def _pipeline_default_downstream_statuses() -> List[str]:
+    return ["OK_MIN", "OK_TS", "OK_NOFREQ", "OK_SP"]
+
+
+def _parse_status_list(value: Optional[str]) -> List[str]:
+    if value is None or not str(value).strip():
+        return _pipeline_default_downstream_statuses()
+    return [s.strip() for s in str(value).split(",") if s.strip()]
+
+
+def _load_pipeline_manifest(run_dir: Path) -> Dict[str, Any]:
+    path = run_dir / "manifest.json"
+    if not path.is_file():
+        raise typer.BadParameter(f"manifest.json not found: {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _pipeline_config(run_dir: Path) -> Dict[str, Any]:
+    man = _load_pipeline_manifest(run_dir)
+    return dict(man.get("config") or {})
+
+
+def _make_pipeline_run(run_dir: Path, *, stages: List[Any], config: Dict[str, Any], name: str):
+    from labtools.pipeline.run import PipelineRun
+    return PipelineRun(run_dir=run_dir.expanduser().resolve(), pipeline_name=name, config=config, stages=stages)
+
+
+@pipeline_app.command("run")
+def pipeline_run_cmd(
+    plan: Path = typer.Option(..., "--plan"),
+    run_dir: Path = typer.Option(..., "--run-dir"),
+    submit: bool = typer.Option(False, "--submit"),
+    collect: bool = typer.Option(False, "--collect"),
+    outdir: Optional[Path] = typer.Option(None, "--outdir"),
+    profile: str = typer.Option("medium", "--profile"),
+    sbatch_template: str = typer.Option("single_orca_job.sbatch.j2", "--sbatch-template"),
+    validate_only: bool = typer.Option(False, "--validate-only"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    downstream_task: Optional[str] = typer.Option(None, "--downstream-task"),
+    downstream_method: Optional[str] = typer.Option(None, "--downstream-method"),
+    downstream_basis: Optional[str] = typer.Option(None, "--downstream-basis"),
+    downstream_id_suffix: Optional[str] = typer.Option(None, "--downstream-id-suffix"),
+    downstream_on_status: Optional[str] = typer.Option(None, "--downstream-on-status"),
+):
+    from labtools.pipeline.builtin import PlanRenderStage, OrcaSubmitStage, OrcaCollectStage
+    plan = plan.expanduser().resolve()
+    run_dir = run_dir.expanduser().resolve()
+    stages: List[Any] = [PlanRenderStage()]
+    if submit:
+        stages.append(OrcaSubmitStage())
+    if collect:
+        stages.append(OrcaCollectStage())
+    pipeline_name = "plan_render" + ("_submit" if submit else "") + ("_collect" if collect else "")
+    config = {
+        "plan": str(plan),
+        "outdir": str(outdir.expanduser().resolve()) if outdir else None,
+        "submit": bool(submit),
+        "collect": bool(collect),
+        "profile": profile,
+        "sbatch_template": sbatch_template,
+        "validate_only": bool(validate_only),
+        "dry_run": bool(dry_run),
+        "downstream_task": downstream_task,
+        "downstream_method": downstream_method,
+        "downstream_basis": downstream_basis,
+        "downstream_id_suffix": downstream_id_suffix,
+        "downstream_on_status": _parse_status_list(downstream_on_status),
+    }
+    pr = _make_pipeline_run(run_dir, stages=stages, config=config, name=pipeline_name)
+    pr.init(allow_exists=False)
+    result = pr.run(resume=False)
+    if result.get("ok"):
+        typer.secho(f"OK: run_dir={run_dir}", fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+
+@pipeline_app.command("collect")
+def pipeline_collect_cmd(run_dir: Path = typer.Option(..., "--run-dir")):
+    from labtools.pipeline.builtin import OrcaCollectStage
+    run_dir = run_dir.expanduser().resolve()
+    cfg = _pipeline_config(run_dir)
+    result = _make_pipeline_run(run_dir, stages=[OrcaCollectStage()], config=cfg, name="collect").run(resume=False)
+    if result.get("ok"):
+        typer.secho(f"OK: run_dir={run_dir}", fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+
+@pipeline_app.command("materialize")
+def pipeline_materialize_cmd(run_dir: Path = typer.Option(..., "--run-dir")):
+    from labtools.pipeline.builtin import MaterializeDownstreamStage
+    run_dir = run_dir.expanduser().resolve()
+    cfg = _pipeline_config(run_dir)
+    result = _make_pipeline_run(run_dir, stages=[MaterializeDownstreamStage()], config=cfg, name="materialize").run(resume=False)
+    if result.get("ok"):
+        typer.secho(f"OK: run_dir={run_dir}", fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+
+@pipeline_app.command("advance")
+def pipeline_advance_cmd(run_dir: Path = typer.Option(..., "--run-dir"), submit: bool = typer.Option(True, "--submit/--no-submit")):
+    from labtools.pipeline.builtin import OrcaSubmitStage, OrcaCollectStage, MaterializeDownstreamStage
+    from labtools.pipeline.slurm_status import detect_frontier
+    run_dir = run_dir.expanduser().resolve()
+    cfg = _pipeline_config(run_dir)
+    frontier = detect_frontier(run_dir)
+    action = str(frontier.get("action") or "")
+    if action == "submit":
+        if not submit:
+            typer.echo("Next frontier is submit, but --no-submit was set.")
+            return
+        stages: List[Any] = [OrcaSubmitStage()]
+    elif action == "collect":
+        stages = [OrcaCollectStage()]
+    elif action == "materialize":
+        stages = [MaterializeDownstreamStage()]
+    elif action == "wait":
+        typer.echo(f"Waiting: {frontier.get('reason')}")
+        return
+    elif action == "finish":
+        typer.echo(f"Up to date: {frontier.get('reason')}")
+        return
+    else:
+        typer.echo(f"No action: {frontier.get('reason')}")
+        return
+    result = _make_pipeline_run(run_dir, stages=stages, config=cfg, name=f"advance_{action}").run(resume=False)
+    if result.get("ok"):
+        typer.secho(f"Advanced frontier: {action}", fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"FAIL advancing {action}: {result.get('message')}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+
+@pipeline_app.command("status")
+def pipeline_status_cmd(run_dir: Path = typer.Option(..., "--run-dir"), jobs: bool = typer.Option(False, "--jobs")):
+    from labtools.pipeline.slurm_status import summarize_audit, load_artifact_data, gather_submit_status, detect_frontier
+    run_dir = run_dir.expanduser().resolve()
+    _load_pipeline_manifest(run_dir)
+    typer.echo(f"Pipeline run: {run_dir}\n")
+    stages = summarize_audit(run_dir / "audit.jsonl")
+    typer.echo("Stages")
+    if not stages:
+        typer.echo("  (none)")
+    for name, st in stages.items():
+        ok = st.get("ok")
+        label = "OK" if ok is True else ("FAIL" if ok is False else "SKIP")
+        start = st.get("start") or st.get("skip_ts") or ""
+        end = st.get("end") or ""
+        msg = st.get("message") or st.get("skip_reason") or ""
+        typer.echo(f"  {label:<7} {name:<22} {start} -> {end} {msg}".rstrip())
+    render = load_artifact_data(run_dir, "RenderBatch") or {}
+    if render:
+        typer.echo("\nRenderBatch")
+        typer.echo(f"  jobs rendered: {render.get('n_jobs')}")
+        typer.echo(f"  jobs_outdir:   {render.get('jobs_outdir')}")
+    frontier = detect_frontier(run_dir)
+    typer.echo("\nNext frontier")
+    typer.echo(f"  action: {frontier.get('action')}")
+    typer.echo(f"  reason: {frontier.get('reason')}")
+    submit_data = load_artifact_data(run_dir, "SubmitBatch") or {}
+    if submit_data:
+        typer.echo("\nSubmitBatch")
+        typer.echo(f"  jobs tracked:    {submit_data.get('n_jobs')}")
+        typer.echo(f"  profile:         {submit_data.get('profile')}")
+        typer.echo(f"  dry_run:         {submit_data.get('dry_run')}")
+        typer.echo(f"  validate_only:   {submit_data.get('validate_only')}")
+        typer.echo(f"  sbatch_template: {submit_data.get('sbatch_template')}")
+        sstat = gather_submit_status(run_dir)
+        typer.echo("\nScheduler summary")
+        for state, n in sorted(dict(sstat.get("counts") or {}).items()):
+            typer.echo(f"  {state:<12} {n}")
+        if jobs:
+            typer.echo("\nJobs")
+            for row in sstat.get("per_job") or []:
+                typer.echo(f"  {row.get('state'):<12} {row.get('job_id'):<12} {row.get('job_dir')}")
+    collect = load_artifact_data(run_dir, "CollectBatch") or {}
+    if collect:
+        typer.echo("\nCollectBatch")
+        typer.echo(f"  jobs tracked:    {collect.get('n_jobs')}")
+        typer.echo(f"  records_jsonl:   {collect.get('records_jsonl')}")
+        counts = dict(collect.get("counts") or {})
+        if counts:
+            typer.echo("  collection counts:")
+            for state, n in sorted(counts.items()):
+                typer.echo(f"    {state:<16} {n}")
+
 def main() -> None:
     app()
 
@@ -2216,24 +2417,32 @@ def mark_cmd(
     df = _pd.read_csv(csv)
 
     touched = 0
-    for _, row in df.iterrows():
-        status = str(row.get("status", "")).strip().upper()
-        p = Path(str(row["path"]))
+    for idx, row in df.iterrows():
+        raw_status = row.get("status", "")
+        status = "" if _pd.isna(raw_status) else str(raw_status).strip().upper()
+
+        raw_path = row.get("path", "")
+        if _pd.isna(raw_path):
+            continue
+        p = Path(str(raw_path)).expanduser()
         if not p.is_dir():
             continue
 
         if status == "OK" and not only_fail:
-            target = p / good
             new_name = good
         elif status == "FAIL":
-            target = p / bad
             new_name = bad
         else:
             continue
 
         # Enforce exclusive state among common sentinels (+ caller-specified good/bad).
-        sentinel_names = ["READY", "STARTED", "DONE", "FAIL", str(good), str(bad)]
-        _set_exclusive_sentinel(p, str(new_name), all_names=sentinel_names, dry_run=dry_run)
+        sentinel_names = list(dict.fromkeys(["READY", "STARTED", "DONE", "FAIL", str(good), str(bad)]))
+        try:
+            _set_exclusive_sentinel(p, str(new_name), all_names=sentinel_names, dry_run=dry_run)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to mark job directory '{p}' from CSV row {idx} with status='{status}' as '{new_name}': {exc}"
+            ) from exc
 
         touched += 1
 
@@ -2412,4 +2621,5 @@ def parse_cmd(
             n_written += 1
 
     typer.secho(f"Wrote {n_written} record(s) → {out_jsonl}", fg=typer.colors.GREEN)
+
 

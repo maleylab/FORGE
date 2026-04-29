@@ -23,6 +23,7 @@ def _get(d: Dict[str, Any], path: str, default: Any = None) -> Any:
 STATUS_OK_MIN = "OK_MIN"
 STATUS_OK_TS = "OK_TS"
 STATUS_OK_NOFREQ = "OK_NOFREQ"
+STATUS_OK_SP = "OK_SP"
 STATUS_BAD_TS_MULTI_IMAG = "BAD_TS_MULTI_IMAG"
 STATUS_FAIL_SCF = "FAIL_SCF"
 STATUS_FAIL_OPT = "FAIL_OPT"
@@ -59,11 +60,11 @@ def classify_record(rec: Dict[str, Any]) -> Dict[str, Any]:
     opt_status = _get(parsed, "opt.status")
     n_imag_raw = _get(parsed, "freq.n_imag")
     n_imag = _coerce_int(n_imag_raw)
+    final_sp_energy = _get(parsed, "final_single_point_energy_au")
+    parsed_errors = parsed.get("errors") or []
 
-    # Default status
     status = STATUS_UNKNOWN
 
-    # Converged geometry branches
     if opt_status == "CONVERGED":
         if n_imag is None:
             status = STATUS_OK_NOFREQ
@@ -76,11 +77,11 @@ def classify_record(rec: Dict[str, Any]) -> Dict[str, Any]:
         else:
             status = STATUS_UNKNOWN
     else:
-        # Non-converged / failed branches
         if scf_converged is False:
             status = STATUS_FAIL_SCF
+        elif opt_status is None and final_sp_energy is not None and not parsed_errors:
+            status = STATUS_OK_SP
         else:
-            # Opt didn't converge, or unknown/aborted
             fail_like = {None, "FAILED", "ABORTED", "MAXCYC_EXCEEDED", "NO_CONVERGENCE", "INTERRUPTED"}
             if opt_status in fail_like:
                 status = STATUS_FAIL_OPT
@@ -130,7 +131,6 @@ def _write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     path = path.expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
-        # Still write an empty file with headers
         fieldnames = ["job_dir", "job_name", "status", "scf_converged", "opt_status", "n_imag"]
         with path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -158,10 +158,8 @@ def make_queues(
     """
     rows = load_and_classify(jsonl_path)
 
-    # Imag queue = converged TSs with exactly 1 imag
     imag_dirs: List[str] = [r["job_dir"] for r in rows if r.get("status") == STATUS_OK_TS and r.get("job_dir")]
 
-    # Failed queue = clearly failed jobs or multi-imag TSs
     failed_statuses = {STATUS_FAIL_SCF, STATUS_FAIL_OPT, STATUS_BAD_TS_MULTI_IMAG}
     failed_dirs: List[str] = [
         r["job_dir"] for r in rows if r.get("status") in failed_statuses and r.get("job_dir")
@@ -177,3 +175,4 @@ def make_queues(
         _write_csv(out_csv, rows)
 
     return len(rows), len(set(imag_dirs)), len(set(failed_dirs))
+
