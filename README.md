@@ -1,75 +1,336 @@
-# lab-tools
+# FORGE (lab-tools)
 
-General-purpose, reusable tools for our lab: ORCA parsing, SLURM/Jinja helpers, JSONL/Parquet IO, and a small CLI.
+FORGE is a workflow framework for ORCA-based
+computational chemistry.
 
-Install (editable):
-```bash
+It is designed to automate: - ORCA job creation - Plan generation from
+CSV / mapping workflows - Fanout expansion (e.g., method × basis
+campaigns) - Input rendering - SLURM submission - Drone-based autonomous
+execution - Provenance tracking - Parsing, aggregation, and dataset
+generation
+
+FORGE is our group's primary computational infrastructure for
+reproducible, scalable quantum chemistry workflows.
+
+
+------------------------------------------------------------------------
+
+# Installation
+
+Editable install from repository root:
+
+``` bash
 pip install -e .
 ```
 
-CLI:
-```bash
-labtools --help
+Main CLI:
+
+``` bash
+forge --help
 ```
 
-Highlights
-- `labtools.orca.parse`: fast regex parser for ORCA 6.x outputs (E, HOMO/LUMO, gap, walltime)
-- `labtools.data.io`: JSONL append + Parquet rollups
-- `labtools.slurm.render`: Jinja2-based sbatch/input rendering
-- `labtools.chem.descriptors`: simple helpers (e.g., HOMO-LUMO gap)
-- `labtools.plots.energetic_span`: quick plot helper (matplotlib)
+------------------------------------------------------------------------
 
-Conventions
-- JSON records are flat, friendly for JSONL/Parquet
-- CLI favors stdin/stdout for piping
-- Always include `schema_version` in emitted records
+# Core Command Families
 
-## New: provenance + energetic span + templates
-
-- `labtools prov-snapshot` -> JSON with env hash, module list, git SHA, SLURM env.
-- `labtools es` -> compute energetic span from a JSON list of states.
-- Jinja2 templates:
-  - `templates/sbatch/orca_job.sbatch.j2`
-  - `templates/orca/sp.inp.j2`
-
-### Examples
-
-Provenance:
-```bash
-labtools prov-snapshot --project proj-iedda-bond-timing-2025 --out prov.json
+``` bash
+forge job ...
+forge plan ...
+forge submit ...
+forge watch ...
+forge scan ...
+forge parse ...
+forge mark ...
+forge clean ...
 ```
 
-Energetic span:
-```json
-// states.json
-[
-  {"label":"I0","kind":"I","G":0.0},
-  {"label":"TS1","kind":"TS","G":18.2},
-  {"label":"I1","kind":"I","G":-2.3},
-  {"label":"TS2","kind":"TS","G":16.1}
-]
-```
-```bash
-labtools es states.json --out span.json
-```
+------------------------------------------------------------------------
 
-Render sbatch:
-```bash
-labtools render templates/sbatch/orca_job.sbatch.j2 out.sbatch job_name=test account=def-yourpi cpus=8 mem=8G input_path=/path/to/input.inp
+# Quick Start
+
+## 1. Single ORCA Job
+
+Create a standard job:
+
+``` bash
+forge job create \
+  --xyz water.xyz \
+  --task optfreq \
+  --method B3LYP \
+  --basis def2-SVP \
+  --outdir jobs
 ```
 
-## Schemas (Pydantic)
+This creates:
 
-Programmatic validation is available in `labtools.schemas`:
-- `OrcaRecord`
-- `EnergeticSpanResult`
-- `Provenance`
-
-Example:
-```python
-from labtools.schemas import OrcaRecord
-rec = OrcaRecord(**some_dict)
-json_str = rec.model_dump_json(indent=2)
+``` text
+jobs/
+└── water_optfreq/
+    ├── job.inp
+    ├── job.sbatch
+    ├── plan_entry.json
+    └── READY
 ```
 
-Added fragments schema and CLI: fragments-validate, fragments-map.
+Submit immediately:
+
+``` bash
+forge job create ... --submit
+```
+
+## 2. CSV → Plan Workflow
+
+FORGE supports semicolon-delimited fanout for campaign generation.
+
+Example CSV:
+
+``` csv
+id,structure,method,basis
+h2_001,h2.xyz,B3LYP;PBE0,def2-SVP;def2-TZVP
+```
+
+Generate plan:
+
+``` bash
+forge plan-from-csv \
+  --csv jobs.csv \
+  --mapping mapping.yaml \
+  --outdir plan
+```
+
+As a practical note, it's convenient to have one primary mapping file located somewhere and give the path to it here. (e.g., --mapping $HOME/mapping.yaml)
+
+Render:
+
+``` bash
+forge plan render \
+  --plan plan/planentries.jsonl \
+  --outdir build
+```
+
+------------------------------------------------------------------------
+
+# Drones (Recommended Primary Run Mode)
+
+## What drones are:
+
+Drones are autonomous worker jobs submitted to SLURM that continuously
+poll a queue directory, pick up available READY jobs, run them, and
+repeat until walltime expires.
+
+## Why drones are preferred:
+
+-   Better queue efficiency
+-   Fewer scheduler submissions
+-   Continuous throughput
+-   Excellent for large campaigns
+-   More flexible than standard arrays
+-   Easier restart/replenishment
+
+## Standard drone workflow:
+
+### Step 1: Render jobs
+
+``` bash
+forge plan render --plan plan/planentries.jsonl --outdir build
+```
+
+### Step 2: Ready jobs
+
+From inside the directory containing the jobs (usually build/jobs), create a READY sentinel in each job directory.
+``` bash
+find . -mindepth 1 -type d -exec touch {}/READY \;
+```
+
+### Step 3: Launch drones
+Still inside of the jobs/ folder, run
+``` bash
+forge submit drone --queue-dir . --n --mem-per-cpu --nprocs --time
+```
+where:
+- --n = number of drones to submit
+- --mem-per-cpu = GB per core
+- --nprocs = number of cores
+- --time = time in hh:mm:ss format
+
+For example, if you wish to submit 10 drones, each requesting 8 cores and 4GB mem for 1 day
+```Bash
+forge submit drone --queue-dir . --n 10 --nprocs 8 --mem-per-cpu 4G --time 24:00:00
+```
+
+
+
+# Core Concepts
+
+## Job
+
+A single ORCA calculation directory:
+
+``` text
+job.inp
+job.sbatch
+plan_entry.json
+READY
+```
+
+## PlanEntry
+
+A normalized JSON representation of: - system - task - parameters -
+provenance
+
+## Fanout
+
+Automatic expansion of list-valued parameters into campaigns:
+
+``` text
+B3LYP;PBE0 × def2-SVP;def2-TZVP
+```
+
+------------------------------------------------------------------------
+
+# Status Files
+
+``` text
+READY     job prepared
+STARTED   job running
+DONE      job completed successfully
+FAIL      job failed
+GOOD/BAD  manual or QC promotion states
+```
+
+------------------------------------------------------------------------
+
+# Operational Utilities
+
+# `forge scan`
+
+Scans a directory for job statuses.
+
+``` bash
+forge scan build/jobs
+```
+
+Purpose: - Post job inspection
+
+# `forge mark`
+
+This creates various post run status files in the job directories
+
+``` bash
+forge mark --csv results.csv
+```
+
+Typical uses: - Promote successful jobs - Mark failures
+
+# `forge clean`
+
+This clears out failed job directories. It re-writes the input file with the last set of coordinates ORCA produced.
+
+``` bash
+forge clean build/jobs
+```
+
+Typical uses: - Preparing jobs for restart
+
+
+# `forge parse`
+
+Extracts structured ORCA results into machine-readable JSONL.
+
+``` bash
+forge parse build/jobs --out parsed.jsonl
+```
+
+Output: - downstream analysis - CSV conversion - Parquet archival - QC
+workflows
+
+
+
+------------------------------------------------------------------------
+
+# Common Student Workflow
+
+``` bash
+forge plan-from-csv ...
+forge plan render ...
+forge scan build/jobs
+forge submit-drone build/jobs
+forge parse build/jobs --out parsed.jsonl
+```
+
+------------------------------------------------------------------------
+
+# Common Failure Modes
+
+## "No .inp file found"
+
+Render failure or wrong directory.
+
+## "Run directory already exists"
+
+Use:
+
+``` bash
+--exists overwrite
+```
+
+## Incorrect method / basis
+
+Usually mapping or fanout configuration.
+
+## Queue delay
+
+SLURM wait time ≠ FORGE failure.
+
+## SCF / ORCA crash
+
+FORGE succeeded; chemistry failed.
+
+------------------------------------------------------------------------
+
+# Safety / Best Practices
+
+## Always:
+
+-   Use `--dry-run` when learning
+-   Validate one job before scaling
+-   Preserve `plan_entry.json`
+-   Prefer drones for campaigns
+-   Parse outputs into structured datasets
+
+## Avoid:
+
+-   Manual edits to generated inputs unless necessary
+-   Large campaigns without test runs
+-   Deleting provenance/state markers blindly
+
+------------------------------------------------------------------------
+
+# Templates
+
+FORGE uses Jinja2 templates for:
+
+``` text
+templates/orca/
+templates/sbatch/
+```
+
+These control: - ORCA input structure - `%maxcore` - `%pal` - SCF
+settings - SLURM directives
+
+------------------------------------------------------------------------
+
+# Student Onboarding Recommendation
+
+Minimum competency:
+
+``` bash
+forge job create
+forge plan-from-csv
+forge plan render
+forge scan
+forge submit-drone
+forge parse
+forge mark
+forge clean
+```
