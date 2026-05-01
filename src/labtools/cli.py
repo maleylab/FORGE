@@ -6,8 +6,6 @@ import json
 import os
 import re
 import subprocess
-import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -15,27 +13,15 @@ import pandas as _pd
 import typer
 
 # Chemistry / descriptors
-from labtools.chem.descriptors import homo_lumo_gap
+
 
 # IO helpers
-from labtools.data.io import jsonl_append, jsonl_to_parquet
-from labtools.orca.parse import parse_orca_file, collect_job_record 
-from labtools.orca.nudge_or_rebuild import nudge_ifreq_jobs, rebuild_failed_jobs
-from labtools.orca.queues import make_queues
-
-# Provenance
-from labtools.prov import snapshot as snap_mod
+from labtools.data.io import jsonl_to_parquet
+from labtools.orca.parse import collect_job_record 
+from labtools.orca.nudge_or_rebuild import nudge_ifreq_jobs
 
 # Templates / SLURM rendering
 from labtools.slurm.render import render_template
-
-# Optional legacy helper (older FORGE versions). Keep CLI importable even if missing.
-try:
-    from labtools.slurm.render import render_plan_jobs  # type: ignore
-except Exception:  # pragma: no cover
-    render_plan_jobs = None  # type: ignore
-
-from labtools.slurm.render import render_plan_entrypoint as render_plan
 
 # Submission dispatcher
 from labtools.submit import dispatch
@@ -201,10 +187,6 @@ def tsfp_verify(
 # PlanEntry CLI
 # ==========================================================
 
-
-def _repo_templates_root() -> Path:
-    return Path(__file__).resolve().parents[2] / "templates"
-
 def _templates_root() -> Path:
     """
     Find the *package* templates directory robustly, both in editable installs
@@ -261,8 +243,8 @@ def plan_render_cmd(
     plan: Path = typer.Option(..., "--plan"),
     outdir: Path = typer.Option("build/jobs", "--outdir"),
 ):
-    from labtools.plans.render import render_planentries
-    from jinja2 import Environment, FileSystemLoader, ChainableUndefined
+    """Render PlanEntries to ORCA job directories using the canonical renderer."""
+    from labtools.plans.render import render_planentries, render_single_job_orca
 
     plan = plan.expanduser().resolve()
     outdir = outdir.expanduser().resolve()
@@ -270,9 +252,6 @@ def plan_render_cmd(
     if not plan.is_file():
         raise typer.BadParameter(f"Plan file not found: {plan}")
 
-    # -------------------------
-    # Load + validate PlanEntries
-    # -------------------------
     entries = []
     with plan.open("r", encoding="utf-8") as f:
         for i, line in enumerate(f, start=1):
@@ -281,245 +260,26 @@ def plan_render_cmd(
             try:
                 entries.append(planentry_from_dict(json.loads(line)))
             except Exception as e:
-                raise typer.BadParameter(f"Invalid PlanEntry on line {i}: {e}")
+                raise typer.BadParameter(f"Invalid PlanEntry on line {i}: {e}") from e
 
     if not entries:
         raise typer.BadParameter("No PlanEntries found in plan file")
 
-    # -------------------------
-    # Task → template mapping
-    # -------------------------
-    PLAN_TASK_TEMPLATES = {
-        "sp": "orca/orca_sp.inp.j2",
-        "opt": "orca/orca_opt.inp.j2",
-        "freq": "orca/orca_freq.inp.j2",
-        "optfreq": "orca/orca_optfreq.inp.j2",
-        "irc": "orca/orca_irc.inp.j2",
-        "nmr": "orca/orca_nmr.inp.j2",
-        "sp-triplet": "orca/orca_sp_triplet.inp.j2",
-        "gradient": "orca/orca_grad.inp.j2",
-        "tsopt": "orca/orca_tsopt.inp.j2"
-    }
+    try:
+        render_planentries(
+            entries,
+            render_func=render_single_job_orca,
+            outdir=outdir,
+            write_plan_entry_json=True,
+        )
+    except Exception as e:
+        raise typer.BadParameter(f"Failed to render PlanEntries: {e}") from e
 
-    # -------------------------
-    # Jinja environment (robust)
-    # -------------------------
-    templates_root = _templates_root()
-    env = Environment(
-        loader=FileSystemLoader(str(templates_root)),
-        undefined=ChainableUndefined,
-        autoescape=False,
-    )
-
-    # -------------------------
-    # Single-job renderer
-    # -------------------------
-    def _render_single_job(job: Dict[str, Any], *, job_dir: Path):
-        """Render a single PlanEntry render-context dict to job.inp.
-
-        NOTE: `render_planentries()` passes `planentry_to_render_context(entry)` as `job`.
-        That object is already normalized (scf/cpcm/freq dicts at top-level, defaults present).
-        Do not re-parse `_row_raw` here.
-        """
-
-        # -------------------------
-        # Resolve task → template
-        # -------------------------
-        task = job.get("job_type")
-        if not task:
-            raise typer.BadParameter("PlanEntry missing parameters.job_type")
-        task = str(task).strip().lower()
-
-        if task not in PLAN_TASK_TEMPLATES:
-            raise typer.BadParameter(f"Unknown task '{task}'")
-
-        # -------------------------
-        # Structure + geometry
-        # -------------------------
-        structure = job.get("structure") or job.get("system")
-        if not structure:
-            raise typer.BadParameter("PlanEntry missing structure/system path")
-
-        structure = Path(str(structure))
-        if not structure.is_file():
-            raise typer.BadParameter(f"Structure file not found: {structure}")
-
-        # Prefer pre-populated geom_lines if present (may be empty if intent.system was a string).
-        geom_lines = job.get("geom_lines") if isinstance(job.get("geom_lines"), list) else []
-        if not geom_lines:
-            lines = structure.read_text(encoding="utf-8").strip().splitlines()
-            if lines and lines[0].strip().isdigit():
-                lines = lines[2:]  # strip XYZ header
-            geom_lines = lines
-
-        # -------------------------
-        # Required ORCA fields
-        # -------------------------
-        method = job.get("method")
-        if not method:
-            raise typer.BadParameter("PlanEntry missing parameters.method")
-
-        charge = job.get("charge", 0)
-        mult = job.get("multiplicity", job.get("mult", 1))
-
-        try:
-            charge = int(charge)
-        except Exception:
-            raise typer.BadParameter(f"Invalid charge: {charge!r}")
-
-        try:
-            mult = int(mult)
-        except Exception:
-            raise typer.BadParameter(f"Invalid multiplicity: {mult!r}")
-
-        # -------------------------
-                # -------------------------
-        # Optional controls + flexible keyword injection
-        # -------------------------
-        def _as_dict(x):
-            return x if isinstance(x, dict) else {}
-
-        def _as_list(x):
-            if x is None:
-                return []
-            if isinstance(x, list):
-                return x
-            if isinstance(x, str):
-                s = x.strip()
-                return s.split() if s else []
-            return []
-
-        def _deep_set(d: Dict[str, Any], dotted: str, val: Any) -> None:
-            parts = [p for p in str(dotted).split(".") if p]
-            cur = d
-            for p in parts[:-1]:
-                nxt = cur.get(p)
-                if not isinstance(nxt, dict):
-                    nxt = {}
-                    cur[p] = nxt
-                cur = nxt
-            if parts:
-                cur[parts[-1]] = val
-
-        # Merge sources (row raw → parameters → top-level) conservatively.
-        # This restores support for dotted keys like scf.Convergence, freq.QRRHORefFreq, irc.MaxIter, etc.
-        params = job.get("parameters") if isinstance(job.get("parameters"), dict) else {}
-
-        row: Dict[str, Any] = {}
-        if isinstance(job.get("_row_raw"), dict):
-            row = job.get("_row_raw")  # type: ignore[assignment]
-        elif isinstance(params.get("_row_raw"), dict):
-            row = params.get("_row_raw")  # type: ignore[assignment]
-
-        # Expanded PlanEntry parameters must win over raw CSV backup values.
-        # Otherwise fanout-rendered scalar values get overwritten by _row_raw lists/strings.
-        srcs = [params, job, row]
-
-        def _first(key: str, default=None):
-            for s in srcs:
-                if isinstance(s, dict) and key in s and s[key] is not None:
-                    return s[key]
-            return default
-
-        basis = _first("basis", None)
-        grid = _first("grid", None)
-        if isinstance(grid, str):
-            grid = grid.strip() or None
-
-        flags = _as_list(_first("flags", None))
-        restart_flags = _as_list(_first("restart_flags", None))
-
-        pal = _first("pal", None)
-        pal = int(pal) if pal is not None and str(pal).strip() != "" else None
-
-        maxcore = _first("maxcore_mb", None)
-        maxcore = int(maxcore) if maxcore is not None and str(maxcore).strip() != "" else None
-
-        scf_opts = _as_dict(_first("scf", {}))
-        cpcm_opts = _as_dict(_first("cpcm", {}))
-        freq_opts = _as_dict(_first("freq", {}))
-        irc_opts = _as_dict(_first("irc", {}))
-        geom_opts = _as_dict(_first("geom", {}))
-
-        # Apply dotted overrides from any source dict
-        for s in srcs:
-            if not isinstance(s, dict):
-                continue
-            for k, v in s.items():
-                if not isinstance(k, str) or "." not in k:
-                    continue
-                if k.startswith("scf."):
-                    _deep_set(scf_opts, k[4:], v)
-                elif k.startswith("cpcm."):
-                    _deep_set(cpcm_opts, k[5:], v)
-                elif k.startswith("freq."):
-                    _deep_set(freq_opts, k[5:], v)
-                elif k.startswith("irc."):
-                    _deep_set(irc_opts, k[4:], v)
-                elif k.startswith("geom."):
-                    _deep_set(geom_opts, k[5:], v)
-
-        # -------------------------
-        # Template context (ALWAYS COMPLETE)
-        # -------------------------
-        ctx = {
-            "method": method,
-            "basis": basis,
-            "grid": grid,
-            "flags": flags,
-            "restart_flags": restart_flags,
-            "charge": charge,
-            "mult": mult,
-            "geom_lines": geom_lines,
-            "geom": {
-                "lines": geom_lines,
-                "constraints": geom_opts.get("constraints", []),
-                **{k: v for k, v in geom_opts.items() if k != "constraints"},
-            },
-            "scf": scf_opts,
-            "cpcm": cpcm_opts,
-            "freq": freq_opts,
-            "irc": irc_opts,
-        }
-
-        if pal is not None:
-            ctx["pal"] = pal
-        if maxcore is not None:
-            ctx["maxcore_mb"] = maxcore
-
-# Render
-        # -------------------------
-        template = env.get_template(PLAN_TASK_TEMPLATES[task])
-        text = template.render(**ctx)
-
-        lines = text.splitlines()
-        cleaned = []
-        prev_blank = False
-        for line in lines:
-            blank = not line.strip()
-            if blank and prev_blank:
-                continue
-            cleaned.append(line.rstrip())
-            prev_blank = blank
-
-        text = "\n".join(cleaned).strip() + "\n"
-
-        (job_dir / "job.inp").write_text(text, encoding="utf-8")
-
-    # -------------------------
-    # Render all entries
-    # -------------------------
-    render_planentries(entries, render_func=_render_single_job, outdir=outdir)
     typer.secho(f"Rendered {len(entries)} jobs → {outdir}", fg=typer.colors.GREEN)
-
-
 
 # ==========================================================
 # TSGen 2.0
 # ==========================================================
-
-
-
 
 @tsgen2_app.command("init")
 def tsgen2_init(
@@ -611,7 +371,7 @@ def tsgen2_run_autonomous(
     typer.secho("TSGen2 autonomous pipeline completed.", fg=typer.colors.GREEN)
 
 
-@tsgen2_app.command("pipeline-l0")
+@tsgen2_app.command("pipeline-l0", hidden=True)
 def tsgen2_pipeline_l0(
     plan: Path = typer.Option(..., "--plan"),
     run_dir: Path = typer.Option(..., "--run-dir"),
@@ -652,7 +412,7 @@ def tsgen2_pipeline_l0(
         raise typer.Exit(1)
 
 
-@tsgen2_app.command("promote-l0")
+@tsgen2_app.command("promote-l0", hidden=True)
 def tsgen2_promote_l0(
     run_dir: Path = typer.Option(..., "--run-dir"),
     max_promote: int = typer.Option(3, "--max-promote"),
@@ -680,7 +440,7 @@ def tsgen2_promote_l0(
 # ==========================================================
 
 
-@tsgen2_app.command("pipeline-l1")
+@tsgen2_app.command("pipeline-l1", hidden=True)
 def tsgen2_pipeline_l1(
     plan: Path = typer.Option(..., "--plan"),
     run_dir: Path = typer.Option(..., "--run-dir"),
@@ -724,7 +484,7 @@ def tsgen2_pipeline_l1(
 
 
 
-@tsgen2_app.command("pipeline-l2")
+@tsgen2_app.command("pipeline-l2", hidden=True)
 def tsgen2_pipeline_l2(
     plan: Path = typer.Option(..., "--plan"),
     run_dir: Path = typer.Option(..., "--run-dir"),
@@ -765,7 +525,7 @@ def tsgen2_pipeline_l2(
     else:
         typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
         raise typer.Exit(1)
-@tsgen2_app.command("promote-l1")
+@tsgen2_app.command("promote-l1", hidden=True)
 def tsgen2_promote_l1(
     plan: Path = typer.Option(..., "--plan"),
     run_dir: Path = typer.Option(..., "--run-dir"),
@@ -792,7 +552,7 @@ def tsgen2_promote_l1(
         typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
         raise typer.Exit(1)
 
-@tsgen2_app.command("promote-l2")
+@tsgen2_app.command("promote-l2", hidden=True)
 def tsgen2_promote_l2(
     run_dir: Path = typer.Option(..., "--run-dir"),
     max_promote: int = typer.Option(0, "--max-promote", help="Maximum L2 candidates to promote; 0 promotes all survivors."),
@@ -818,7 +578,7 @@ def tsgen2_promote_l2(
         typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
         raise typer.Exit(1)
 
-@tsgen2_app.command("verify")
+@tsgen2_app.command("verify", hidden=True)
 def tsgen2_verify(
     run_dir: Path = typer.Option(..., "--run-dir"),
     mode: str = typer.Option("exploratory", "--mode", help="Only 'exploratory' is currently implemented."),
@@ -843,52 +603,10 @@ def tsgen2_verify(
     else:
         typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
         raise typer.Exit(1)
+
+# ==========================================================
 # Helper Utilities
 # ==========================================================
-
-
-def _get(d: dict, path: str, default=None):
-    cur: Any = d
-    for part in path.split("."):
-        if not isinstance(cur, dict):
-            return default
-        cur = cur.get(part)
-    return default if cur is None else cur
-
-
-def _slugify(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_")
-
-
-def _sanitize_name(name: str) -> str:
-    return _slugify(name)
-
-
-def _repo_templates_root() -> Path:
-    return Path(__file__).resolve().parents[2] / "templates"
-
-
-def _coerce_value(v: str) -> Any:
-    if v.lower() in ("true", "yes", "on"):
-        return True
-    if v.lower() in ("false", "no", "off"):
-        return False
-    try:
-        return float(v) if "." in v else int(v)
-    except ValueError:
-        return v
-
-
-def _load_geometry_block(geometry_file: Optional[Path], geometry_literal: Optional[str]):
-    if geometry_file:
-        text = geometry_file.read_text(encoding="utf-8").strip().splitlines()
-        if len(text) >= 2 and text[0].isdigit():
-            text = text[2:]
-        return "\n".join(text) + "\n"
-    if geometry_literal:
-        return geometry_literal.replace("\\n", "\n")
-    return None
-
 
 def _flatten_record(d: Dict[str, Any], prefix: str = "", out: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Flatten nested dict/list records into a single dict suitable for CSV.
@@ -952,8 +670,6 @@ def _set_exclusive_sentinel(job_dir: Path, new_name: str, *, all_names: List[str
     else:
         tgt.write_text("", encoding="utf-8")
 
-
-# ==========================================================
 
 # ==========================================================
 # GJF → XYZ helper (Gaussian input from GaussView)
@@ -1252,7 +968,7 @@ def submit_drone_workers(
     profile: str = typer.Option("medium", "--profile"),
     nprocs: int = typer.Option(8, "--nprocs"),
     mem_per_cpu: str = typer.Option("4G", "--mem-per-cpu"),
-    time: str = typer.Option("00:10:00", "--time"),
+    walltime: str = typer.Option("00:10:00", "--time"),
     validate_only: bool = typer.Option(False, "--validate-only"),
 ):
     """Submit one or more FORGE drone workers for a queue directory."""
@@ -1279,7 +995,7 @@ def submit_drone_workers(
         params = {
             "job_name": name,
             "jobdir": str(queue_dir),
-            "time": time,
+            "time": walltime,
             "nprocs": int(nprocs),
             "mem_per_cpu": mem_per_cpu,
             "QUEUE_DIR": str(queue_dir),
@@ -2029,124 +1745,12 @@ def pipeline_status_cmd(run_dir: Path = typer.Option(..., "--run-dir"), jobs: bo
             for state, n in sorted(counts.items()):
                 typer.echo(f"    {state:<16} {n}")
 
-def main() -> None:
-    app()
-
-
-if __name__ == "__main__":
-    main()
-
 
 # ==========================================================
 # Single-job CLI (create/import) + Operational tooling (scan/mark/clean)
 # ==========================================================
 
-from typing import Tuple
 
-
-def _read_xyz_geom_lines(xyz_path: Path) -> List[str]:
-    try:
-        return single_job.read_xyz_geom_lines(xyz_path)
-    except FileNotFoundError as e:
-        raise typer.BadParameter(str(e)) from e
-
-
-def _orca_template_for_task(task: str) -> Path:
-    try:
-        return single_job.orca_template_for_task(task, templates_root=_templates_root())
-    except (FileNotFoundError, ValueError) as e:
-        raise typer.BadParameter(str(e)) from e
-
-
-def _sbatch_template() -> Path:
-    try:
-        return single_job.sbatch_template(templates_root=_templates_root())
-    except FileNotFoundError as e:
-        raise typer.BadParameter(str(e)) from e
-
-
-def _default_job_name_from_xyz(xyz: Path, task: str) -> str:
-    return single_job.default_job_name_from_xyz(xyz, task)
-
-
-def _build_minimal_payload(
-    *,
-    xyz: Path,
-    task: str,
-    method: str,
-    charge: int,
-    mult: int,
-    basis: Optional[str],
-    flags: List[str],
-    restart_flags: List[str],
-    nprocs: Optional[int],
-    maxcore_mb: Optional[int],
-    time: Optional[str],
-    maxiter: Optional[int],
-    cpcm_eps: Optional[float],
-    cpcm_refrac: Optional[float],
-) -> Dict[str, Any]:
-    try:
-        return single_job.build_minimal_payload(
-            xyz=xyz,
-            task=task,
-            method=method,
-            charge=charge,
-            mult=mult,
-            basis=basis,
-            flags=flags,
-            restart_flags=restart_flags,
-            nprocs=nprocs,
-            maxcore_mb=maxcore_mb,
-            time=time,
-            maxiter=maxiter,
-            cpcm_eps=cpcm_eps,
-            cpcm_refrac=cpcm_refrac,
-        )
-    except FileNotFoundError as e:
-        raise typer.BadParameter(str(e)) from e
-
-
-def _mem_per_cpu_from_maxcore(maxcore_mb: Optional[int]) -> str:
-    return single_job.mem_per_cpu_from_maxcore(maxcore_mb)
-
-
-def _safe_clear_dir(d: Path) -> None:
-    single_job.safe_clear_dir(d)
-
-
-def _write_job_dir(
-    *,
-    final_dir: Path,
-    payload: Dict[str, Any],
-    task: str,
-    job_name: str,
-    xyz: Optional[Path],
-    write_ready: bool,
-    write_sbatch: bool,
-    nprocs: Optional[int],
-    walltime: str,
-    mem_per_cpu: str,
-    exists: str,
-) -> None:
-    try:
-        single_job.write_job_dir(
-            final_dir=final_dir,
-            payload=payload,
-            task=task,
-            job_name=job_name,
-            xyz=xyz,
-            write_ready=write_ready,
-            write_sbatch=write_sbatch,
-            nprocs=nprocs,
-            walltime=walltime,
-            mem_per_cpu=mem_per_cpu,
-            exists=exists,
-            templates_root=_templates_root(),
-            render_template_fn=render_template,
-        )
-    except (FileExistsError, FileNotFoundError, ValueError) as e:
-        raise typer.BadParameter(str(e)) from e
 
 
 @job_app.command("create")
@@ -2162,7 +1766,7 @@ def job_create(
     name: Optional[str] = typer.Option(None, "--name"),
     outdir: Path = typer.Option(Path("jobs"), "--outdir"),
     nprocs: Optional[int] = typer.Option(None, "--nprocs"),
-    time: str = typer.Option("08:00:00", "--time"),
+    walltime: str = typer.Option("08:00:00", "--time"),
     mem_per_cpu: Optional[str] = typer.Option(None, "--mem-per-cpu", help="SLURM mem-per-cpu (e.g. 4G). Default derived from --maxcore-mb."),
     maxcore_mb: Optional[int] = typer.Option(None, "--maxcore-mb"),
     maxiter: Optional[int] = typer.Option(None, "--maxiter"),
@@ -2179,40 +1783,43 @@ def job_create(
     if exists not in ("fail", "skip", "overwrite"):
         raise typer.BadParameter("--exists must be one of: fail|skip|overwrite")
 
-    job_name = name or _default_job_name_from_xyz(xyz, task)
+    job_name = name or single_job.default_job_name_from_xyz(xyz, task)
     final_dir = outdir / job_name
 
-    payload = _build_minimal_payload(
-        xyz=xyz,
-        task=task,
-        method=method,
-        charge=charge,
-        mult=mult,
-        basis=basis,
-        flags=flag,
-        restart_flags=restart_flag,
-        nprocs=nprocs,
-        time=time,
-        maxcore_mb=maxcore_mb,
-        maxiter=maxiter,
-        cpcm_eps=cpcm_eps,
-        cpcm_refrac=cpcm_refrac,
-    )
+    try:
+        payload = single_job.build_minimal_payload(
+            xyz=xyz,
+            task=task,
+            method=method,
+            charge=charge,
+            mult=mult,
+            basis=basis,
+            flags=flag,
+            restart_flags=restart_flag,
+            nprocs=nprocs,
+            time=walltime,
+            maxcore_mb=maxcore_mb,
+            maxiter=maxiter,
+            cpcm_eps=cpcm_eps,
+            cpcm_refrac=cpcm_refrac,
+        )
+    except FileNotFoundError as e:
+        raise typer.BadParameter(str(e)) from e
 
-    mpc = mem_per_cpu or _mem_per_cpu_from_maxcore(maxcore_mb)
+    mpc = mem_per_cpu or single_job.mem_per_cpu_from_maxcore(maxcore_mb)
 
     if dry_run:
         try:
             single_job.validate_job_input_render(payload=payload, task=task, xyz=xyz)
             if write_sbatch:
                 render_template(
-                    _sbatch_template(),
+                    single_job.sbatch_template(templates_root=_templates_root()),
                     Path("/dev/null"),
                     {
                         "job_dir": str(final_dir),
                         "job_name": job_name,
                         "nprocs": int(nprocs or 1),
-                        "time": time,
+                        "time": walltime,
                         "mem_per_cpu": mpc,
                         "SRC_DIR": str(final_dir),
                         "inp_basename": "job.inp",
@@ -2225,19 +1832,24 @@ def job_create(
         typer.secho("Dry-run OK: canonical ORCA renderer succeeded.", fg=typer.colors.GREEN)
         return
 
-    _write_job_dir(
-        final_dir=final_dir,
-        payload=payload,
-        task=task,
-        job_name=job_name,
-        xyz=xyz,
-        write_ready=write_ready,
-        write_sbatch=write_sbatch,
-        nprocs=nprocs,
-        walltime=time,
-        mem_per_cpu=mpc,
-        exists=exists,
-    )
+    try:
+        single_job.write_job_dir(
+            final_dir=final_dir,
+            payload=payload,
+            task=task,
+            job_name=job_name,
+            xyz=xyz,
+            write_ready=write_ready,
+            write_sbatch=write_sbatch,
+            nprocs=nprocs,
+            walltime=walltime,
+            mem_per_cpu=mpc,
+            exists=exists,
+            templates_root=_templates_root(),
+            render_template_fn=render_template,
+        )
+    except (FileExistsError, FileNotFoundError, ValueError) as e:
+        raise typer.BadParameter(str(e)) from e
 
     typer.secho(f"Created job → {final_dir}", fg=typer.colors.GREEN)
 
@@ -2249,7 +1861,7 @@ def job_create(
             submit_cwd=final_dir,
             sbatch_chdir=final_dir,
             extra_params={
-                "time": time,
+                "time": walltime,
                 "nprocs": int(nprocs or 1),
                 "cpus_per_task": int(nprocs or 1),
                 "mem_per_cpu": mpc,
@@ -2287,7 +1899,7 @@ def job_import(
     final_dir = outdir / str(job_name)
 
     walltime = "08:00:00"
-    mpc = _mem_per_cpu_from_maxcore(int(payload.get("maxcore_mb") or 2000))
+    mpc = single_job.mem_per_cpu_from_maxcore(int(payload.get("maxcore_mb") or 2000))
 
     # attempt to locate structure file if referenced
     xyz = None
@@ -2302,7 +1914,7 @@ def job_import(
             single_job.validate_job_input_render(payload=payload, task=task, xyz=xyz)
             if write_sbatch:
                 render_template(
-                    _sbatch_template(),
+                    single_job.sbatch_template(templates_root=_templates_root()),
                     Path("/dev/null"),
                     {
                         "job_dir": str(final_dir),
@@ -2321,19 +1933,24 @@ def job_import(
         typer.secho("Dry-run OK: canonical ORCA renderer succeeded.", fg=typer.colors.GREEN)
         return
 
-    _write_job_dir(
-        final_dir=final_dir,
-        payload=payload,
-        task=task,
-        job_name=str(job_name),
-        xyz=xyz,
-        write_ready=write_ready,
-        write_sbatch=write_sbatch,
-        nprocs=int(payload.get("pal") or 1),
-        walltime=walltime,
-        mem_per_cpu=mpc,
-        exists=exists,
-    )
+    try:
+        single_job.write_job_dir(
+            final_dir=final_dir,
+            payload=payload,
+            task=task,
+            job_name=str(job_name),
+            xyz=xyz,
+            write_ready=write_ready,
+            write_sbatch=write_sbatch,
+            nprocs=int(payload.get("pal") or 1),
+            walltime=walltime,
+            mem_per_cpu=mpc,
+            exists=exists,
+            templates_root=_templates_root(),
+            render_template_fn=render_template,
+        )
+    except (FileExistsError, FileNotFoundError, ValueError) as e:
+        raise typer.BadParameter(str(e)) from e
 
     typer.secho(f"Imported job → {final_dir}", fg=typer.colors.GREEN)
 
@@ -2691,3 +2308,9 @@ def parse_cmd(
     typer.secho(f"Wrote {n_written} record(s) → {out_jsonl}", fg=typer.colors.GREEN)
 
 
+def main() -> None:
+    app()
+
+
+if __name__ == "__main__":
+    main()
