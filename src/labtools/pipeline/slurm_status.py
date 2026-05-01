@@ -193,9 +193,32 @@ def gather_submit_status(run_dir: Path) -> Dict[str, Any]:
     submit = load_artifact_data(run_dir, "SubmitBatch") or {}
     job_ids_map = dict(submit.get("job_ids") or {})
     job_dirs = list(submit.get("job_dirs") or [])
+    backend = str(submit.get("backend") or "slurm").strip().lower()
 
     dry_run = bool(submit.get("dry_run", False))
     validate_only = bool(submit.get("validate_only", False))
+
+    per_job: List[Dict[str, Any]] = []
+    counts: Dict[str, int] = {}
+
+    if backend == "drone":
+        from labtools.pipeline.drone import drone_job_state
+
+        queue_dir = Path(str(submit.get("queue_dir") or submit.get("jobs_outdir") or "")).expanduser().resolve()
+        for jd in job_dirs:
+            state = drone_job_state(queue_dir / jd)
+            counts[state] = counts.get(state, 0) + 1
+            per_job.append(
+                {
+                    "job_dir": jd,
+                    "job_id": "",
+                    "state": state,
+                    "source": "drone_queue",
+                    "reason": "sentinel",
+                    "exit_code": "",
+                }
+            )
+        return {"submit": submit, "per_job": per_job, "counts": counts}
 
     real_job_ids = [str(job_ids_map.get(jd) or "").strip() for jd in job_dirs]
     real_job_ids = [j for j in real_job_ids if j]
@@ -203,9 +226,6 @@ def gather_submit_status(run_dir: Path) -> Dict[str, Any]:
     squeue_by_id = query_squeue(real_job_ids)
     missing_for_sacct = [j for j in real_job_ids if j not in squeue_by_id]
     sacct_by_id = query_sacct(missing_for_sacct)
-
-    per_job: List[Dict[str, Any]] = []
-    counts: Dict[str, int] = {}
 
     for jd in job_dirs:
         job_id = str(job_ids_map.get(jd) or "").strip()

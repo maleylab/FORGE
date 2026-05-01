@@ -24,6 +24,7 @@ dependencies = [
 # arrow = ["pyarrow>=15"]
 
 [project.scripts]
+forge = "labtools.cli:app"
 labtools = "labtools.cli:app"
 
 [tool.setuptools]

@@ -181,7 +181,10 @@ class OrcaSubmitStage(BaseStage):
         return {
             "render_batch_id": getattr(render_ref, "artifact_id", ""),
             "profile": _cfg(context, "profile", "medium"),
+            "execution_backend": str(_cfg(context, "execution_backend", _cfg(context, "backend", "slurm"))).lower(),
             "sbatch_template": _sbatch_template_name(str(_cfg(context, "sbatch_template", "single_orca_job.sbatch.j2"))),
+            "drone_template": _sbatch_template_name(str(_cfg(context, "drone_template", "drone_worker.sbatch.j2"))),
+            "n_drones": int(_cfg(context, "n_drones", 1)),
             "validate_only": bool(_cfg(context, "validate_only", False)),
             "dry_run": bool(_cfg(context, "dry_run", False)),
             "jobs_outdir": render_data.get("jobs_outdir", ""),
@@ -197,19 +200,138 @@ class OrcaSubmitStage(BaseStage):
             raise RuntimeError("No RenderBatch artifact available for submission")
 
         render_art = Artifact.load(run_dir, render_ref)
-        jobs_outdir = Path(str(render_art.data["jobs_outdir"])).expanduser().resolve()
+        rendered_jobs_outdir = Path(str(render_art.data["jobs_outdir"])).expanduser().resolve()
         job_dirs: List[str] = list(render_art.data["job_dirs"])
 
         profile = str(_cfg(context, "profile", "medium"))
         dry_run = bool(_cfg(context, "dry_run", False))
         validate_only = bool(_cfg(context, "validate_only", False))
-        sbatch_template = _sbatch_template_name(str(_cfg(context, "sbatch_template", "single_orca_job.sbatch.j2")))
+        execution_backend = str(_cfg(context, "execution_backend", _cfg(context, "backend", "slurm"))).strip().lower()
 
+        if execution_backend in {"drone", "drones"}:
+            from labtools.pipeline.drone import enqueue_render_batch, submit_drone_workers
+
+            # Drone mode uses one persistent queue for the whole pipeline run. The
+            # first drone-backed SubmitBatch launches the requested worker pool;
+            # later downstream SubmitBatches only enqueue new READY jobs into the
+            # same queue and reuse the original drone job ids/scripts. This avoids
+            # spawning a new worker pool at every downstream frontier.
+            previous_submit_ref = _find_latest_artifact_ref(run_dir, "SubmitBatch")
+            previous_submit_data: Dict[str, Any] = {}
+            if previous_submit_ref is not None:
+                try:
+                    previous_submit_data = Artifact.load(run_dir, previous_submit_ref).data or {}
+                except Exception:
+                    previous_submit_data = {}
+
+            previous_is_drone = str(previous_submit_data.get("backend") or "").lower() == "drone"
+            previous_queue = previous_submit_data.get("queue_dir") if previous_is_drone else None
+
+            queue_dir_value = _cfg(context, "drone_queue_dir", None)
+            if previous_queue:
+                queue_dir = Path(str(previous_queue)).expanduser().resolve()
+            elif queue_dir_value:
+                queue_dir = Path(str(queue_dir_value)).expanduser().resolve()
+            else:
+                queue_dir = _workspace_dir(context) / "drone_queue"
+
+            enqueue_info = enqueue_render_batch(jobs_outdir=rendered_jobs_outdir, job_dirs=job_dirs, queue_dir=queue_dir)
+
+            n_drones = int(_cfg(context, "n_drones", 1))
+            drone_template = _sbatch_template_name(str(_cfg(context, "drone_template", "drone_worker.sbatch.j2")))
+
+            submitted_new_drones = not previous_is_drone
+            if submitted_new_drones:
+                drone_info = submit_drone_workers(
+                    queue_dir=queue_dir,
+                    n_drones=n_drones,
+                    profile=profile,
+                    sbatch_template=drone_template,
+                    dry_run=dry_run,
+                    validate_only=validate_only,
+                    sleep_secs=int(_cfg(context, "drone_sleep_secs", 30)),
+                    max_idle_cycles=int(_cfg(context, "drone_max_idle_cycles", 10)),
+                    safety_margin_secs=int(_cfg(context, "drone_safety_margin_secs", 900)),
+                    jitter_max_secs=int(_cfg(context, "drone_jitter_max_secs", 60)),
+                    idle_jitter_max_secs=int(_cfg(context, "drone_idle_jitter_max_secs", 10)),
+                    heartbeat_secs=int(_cfg(context, "drone_heartbeat_secs", 60)),
+                    tail_lines=int(_cfg(context, "drone_tail_lines", 200)),
+                )
+                drone_job_ids = list(drone_info.get("drone_job_ids") or [])
+                sbatch_scripts_list = list(drone_info.get("sbatch_scripts") or [])
+            else:
+                drone_job_ids = list(previous_submit_data.get("drone_job_ids") or [])
+                prev_scripts = previous_submit_data.get("sbatch_scripts") or {}
+                if isinstance(prev_scripts, dict):
+                    sbatch_scripts_list = list(prev_scripts.values())
+                else:
+                    sbatch_scripts_list = list(prev_scripts or [])
+
+            job_ids: Dict[str, str] = {jd: "" for jd in job_dirs}
+            sbatch_scripts: Dict[str, str] = {
+                f"drone_{i+1:03d}": s for i, s in enumerate(sbatch_scripts_list)
+            }
+            art = Artifact(
+                kind="SubmitBatch",
+                data={
+                    "render_batch_ref": {
+                        "artifact_id": render_ref.artifact_id,
+                        "kind": render_ref.kind,
+                        "relpath": render_ref.relpath,
+                    },
+                    "jobs_outdir": str(queue_dir),
+                    "rendered_jobs_outdir": str(rendered_jobs_outdir),
+                    "queue_dir": str(queue_dir),
+                    "job_dirs": job_dirs,
+                    "job_ids": job_ids,
+                    "drone_job_ids": drone_job_ids,
+                    "sbatch_scripts": sbatch_scripts,
+                    "backend": "drone",
+                    "submitted_new_drones": submitted_new_drones,
+                    "previous_submit_ref": (
+                        {
+                            "artifact_id": previous_submit_ref.artifact_id,
+                            "kind": previous_submit_ref.kind,
+                            "relpath": previous_submit_ref.relpath,
+                        }
+                        if previous_submit_ref is not None and previous_is_drone
+                        else None
+                    ),
+                    "profile": profile,
+                    "dry_run": dry_run,
+                    "validate_only": validate_only,
+                    "sbatch_template": drone_template,
+                    "n_drones": n_drones,
+                    "n_jobs": len(job_dirs),
+                    "enqueue": enqueue_info,
+                },
+                parents=[render_ref],
+            )
+            ref = art.write(run_dir=run_dir)
+            context["submit_batch_ref"] = ref
+            run = context.get("run")
+            if run is not None and hasattr(run, "audit"):
+                run.audit(
+                    {
+                        "event": "submit_complete",
+                        "stage": self.name,
+                        "n_jobs": len(job_dirs),
+                        "backend": "drone",
+                        "n_drones": n_drones,
+                        "submitted_new_drones": submitted_new_drones,
+                        "dry_run": dry_run,
+                        "validate_only": validate_only,
+                    }
+                )
+            return [ref]
+
+        # Default backend: one rendered job = one sbatch submission.
+        sbatch_template = _sbatch_template_name(str(_cfg(context, "sbatch_template", "single_orca_job.sbatch.j2")))
         job_ids: Dict[str, str] = {}
         sbatch_scripts: Dict[str, str] = {}
 
         for jd in job_dirs:
-            job_dir = jobs_outdir / jd
+            job_dir = rendered_jobs_outdir / jd
             inp_files = sorted(job_dir.glob("*.inp"))
             if not inp_files:
                 raise RuntimeError(f"No .inp file found in {job_dir}")
@@ -237,7 +359,7 @@ class OrcaSubmitStage(BaseStage):
                     "kind": render_ref.kind,
                     "relpath": render_ref.relpath,
                 },
-                "jobs_outdir": str(jobs_outdir),
+                "jobs_outdir": str(rendered_jobs_outdir),
                 "job_dirs": job_dirs,
                 "job_ids": job_ids,
                 "sbatch_scripts": sbatch_scripts,
@@ -260,6 +382,7 @@ class OrcaSubmitStage(BaseStage):
                     "event": "submit_complete",
                     "stage": self.name,
                     "n_jobs": len(job_dirs),
+                    "backend": "slurm",
                     "dry_run": dry_run,
                     "validate_only": validate_only,
                 }

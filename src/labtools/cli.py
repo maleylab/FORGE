@@ -15,12 +15,11 @@ import pandas as _pd
 import typer
 
 # Chemistry / descriptors
-from labtools.chem import energetic_span as es_mod
-from labtools.chem.descriptors import homo_lumo_gap  # noqa: F401
+from labtools.chem.descriptors import homo_lumo_gap
 
 # IO helpers
 from labtools.data.io import jsonl_append, jsonl_to_parquet
-from labtools.orca.parse import parse_orca_file, collect_job_record  # noqa: F401
+from labtools.orca.parse import parse_orca_file, collect_job_record 
 from labtools.orca.nudge_or_rebuild import nudge_ifreq_jobs, rebuild_failed_jobs
 from labtools.orca.queues import make_queues
 
@@ -40,11 +39,12 @@ from labtools.slurm.render import render_plan_entrypoint as render_plan
 
 # Submission dispatcher
 from labtools.submit import dispatch
+from labtools.jobs import single as single_job
 
 # CSV → Plan machinery
 from labtools.csvpipe.loader import read_csv_rows, row_to_job
 from labtools.csvpipe.mapping import build_mapping
-from labtools.csvpipe.expand import gather_axes, expand_product, expand_zip
+from labtools.plans.fanout import axis_paths_from_mapping, collect_fanout_aliases, expand_job_fanout
 from labtools.csvpipe.emit import (
     emit_job_yaml_files,
     job_to_planentry,
@@ -131,6 +131,9 @@ app.add_typer(watch_app, name="watch")
 
 pipeline_app = typer.Typer(help="Artifact-backed pipeline workflows")
 app.add_typer(pipeline_app, name="pipeline")
+
+submit_app = typer.Typer(help="Submit FORGE/ORCA jobs to SLURM")
+app.add_typer(submit_app, name="submit")
 
 
 # ==========================================================
@@ -408,7 +411,9 @@ def plan_render_cmd(
         elif isinstance(params.get("_row_raw"), dict):
             row = params.get("_row_raw")  # type: ignore[assignment]
 
-        srcs = [row, params, job]
+        # Expanded PlanEntry parameters must win over raw CSV backup values.
+        # Otherwise fanout-rendered scalar values get overwritten by _row_raw lists/strings.
+        srcs = [params, job, row]
 
         def _first(key: str, default=None):
             for s in srcs:
@@ -513,8 +518,7 @@ def plan_render_cmd(
 # TSGen 2.0
 # ==========================================================
 
-from labtools.tsgen.plan import TSGenPlan
-from labtools.tsgen.controller import TSGenController
+
 
 
 @tsgen2_app.command("init")
@@ -553,34 +557,292 @@ def tsgen2_init(
 
 
 @tsgen2_app.command("run")
-def tsgen2_run(plan_file: Path):
-    plan_file = plan_file.expanduser().resolve()
-    if not plan_file.is_file():
-        raise typer.BadParameter(f"Plan does not exist: {plan_file}")
+def tsgen2_run_autonomous(
+    plan: Path = typer.Option(..., "--plan", help="TSGen2 plan YAML/JSON."),
+    run_dir: Path = typer.Option(..., "--run-dir", help="Pipeline run directory."),
+    profile: str = typer.Option("medium", "--profile"),
+    sbatch_template: str = typer.Option("single_orca_job.sbatch.j2", "--sbatch-template"),
+    execution_backend: str = typer.Option("slurm", "--backend", help="Execution backend: slurm or drone."),
+    n_drones: int = typer.Option(1, "--n-drones", help="Number of drone workers when --backend drone is used."),
+    poll_seconds: int = typer.Option(60, "--poll-seconds", help="Scheduler polling interval for the driver."),
+    max_wait_minutes: Optional[int] = typer.Option(None, "--max-wait-minutes", help="Optional timeout per submitted stage."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    validate_only: bool = typer.Option(False, "--validate-only"),
+    l0_max_promote: int = typer.Option(3, "--l0-max-promote"),
+    l1_max_promote: int = typer.Option(0, "--l1-max-promote", help="0 promotes all L1 survivors."),
+    l2_max_promote: int = typer.Option(0, "--l2-max-promote", help="0 promotes all L2 survivors."),
+    require_one_imag_l2: bool = typer.Option(True, "--require-one-imag-l2/--no-require-one-imag-l2"),
+    verify_require_one_imag: bool = typer.Option(True, "--verify-require-one-imag/--no-verify-require-one-imag"),
+    quiet: bool = typer.Option(False, "--quiet"),
+):
+    """Run TSGen2 end-to-end using the autonomous pipeline-native driver.
+
+    This is the pipeline-native autonomous runner. In production,
+    submit this command itself as a lightweight SLURM driver job; the driver then
+    submits ORCA jobs, waits for completion, collects outputs, promotes candidates,
+    and advances through L0/L1/L2/verify.
+    """
+    from labtools.tsgen.autodriver import run_tsgen_autonomous
 
     try:
-        if plan_file.suffix.lower() in (".yaml", ".yml"):
-            import yaml
-
-            data = yaml.safe_load(plan_file.read_text(encoding="utf-8"))
-        else:
-            data = json.loads(plan_file.read_text(encoding="utf-8"))
+        result = run_tsgen_autonomous(
+            plan=plan,
+            run_dir=run_dir,
+            profile=profile,
+            sbatch_template=sbatch_template,
+            execution_backend=execution_backend,
+            n_drones=int(n_drones),
+            poll_seconds=int(poll_seconds),
+            max_wait_minutes=max_wait_minutes,
+            dry_run=bool(dry_run),
+            validate_only=bool(validate_only),
+            l0_max_promote=int(l0_max_promote),
+            l1_max_promote=int(l1_max_promote),
+            l2_max_promote=int(l2_max_promote),
+            require_one_imag_l2=bool(require_one_imag_l2),
+            verify_require_one_imag=bool(verify_require_one_imag),
+            verbose=not quiet,
+        )
     except Exception as e:
-        raise typer.BadParameter(f"Failed to parse plan file: {e}")
+        typer.secho(f"FAIL: autonomous TSGen2 driver: {e}", fg=typer.colors.RED)
+        raise typer.Exit(1)
 
-    plan = TSGenPlan(**data)
-    controller = TSGenController(plan)
-    out = controller.run()
+    typer.echo(json.dumps(result, indent=2))
+    typer.secho("TSGen2 autonomous pipeline completed.", fg=typer.colors.GREEN)
 
-    typer.echo(json.dumps(out, indent=2))
 
-    if out.get("status") == "success":
-        typer.secho("TSGen 2.0 pipeline completed.", fg=typer.colors.GREEN)
+@tsgen2_app.command("pipeline-l0")
+def tsgen2_pipeline_l0(
+    plan: Path = typer.Option(..., "--plan"),
+    run_dir: Path = typer.Option(..., "--run-dir"),
+    submit: bool = typer.Option(False, "--submit"),
+    outdir: Optional[Path] = typer.Option(None, "--outdir"),
+    profile: str = typer.Option("medium", "--profile"),
+    sbatch_template: str = typer.Option("single_orca_job.sbatch.j2", "--sbatch-template"),
+    validate_only: bool = typer.Option(False, "--validate-only"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+):
+    """Run the pipeline-native TSGen2 L0 render slice, optionally submitting jobs."""
+    from labtools.pipeline.builtin import OrcaSubmitStage
+    from labtools.tsgen.pipeline_stages import TSGenL0RenderStage
+
+    plan = plan.expanduser().resolve()
+    run_dir = run_dir.expanduser().resolve()
+    stages: List[Any] = [TSGenL0RenderStage()]
+    if submit:
+        stages.append(OrcaSubmitStage())
+
+    config = {
+        "plan": str(plan),
+        "outdir": str(outdir.expanduser().resolve()) if outdir else None,
+        "submit": bool(submit),
+        "profile": profile,
+        "sbatch_template": sbatch_template,
+        "validate_only": bool(validate_only),
+        "dry_run": bool(dry_run),
+    }
+    pipeline_name = "tsgen2_l0_render" + ("_submit" if submit else "")
+    pr = _make_pipeline_run(run_dir, stages=stages, config=config, name=pipeline_name)
+    pr.init(allow_exists=False)
+    result = pr.run(resume=False)
+    if result.get("ok"):
+        typer.secho(f"OK: run_dir={run_dir}", fg=typer.colors.GREEN)
     else:
-        typer.secho("TSGen 2.0 pipeline finished with issues.", fg=typer.colors.YELLOW)
+        typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+
+@tsgen2_app.command("promote-l0")
+def tsgen2_promote_l0(
+    run_dir: Path = typer.Option(..., "--run-dir"),
+    max_promote: int = typer.Option(3, "--max-promote"),
+    debug: bool = typer.Option(False, "--debug"),
+):
+    """Collect completed L0 jobs and emit a TSGenCandidateBatch artifact."""
+    from labtools.pipeline.builtin import OrcaCollectStage
+    from labtools.tsgen.pipeline_stages import TSGenL0PromoteStage
+
+    run_dir = run_dir.expanduser().resolve()
+    cfg = _pipeline_config(run_dir)
+    cfg["max_promote"] = int(max_promote)
+    cfg["l0_max_promote"] = int(max_promote)
+    cfg["debug"] = bool(debug)
+
+    stages: List[Any] = [OrcaCollectStage(), TSGenL0PromoteStage()]
+    result = _make_pipeline_run(run_dir, stages=stages, config=cfg, name="tsgen2_l0_promote").run(resume=False)
+    if result.get("ok"):
+        typer.secho(f"OK: run_dir={run_dir}", fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
+        raise typer.Exit(1)
 
 
 # ==========================================================
+
+
+@tsgen2_app.command("pipeline-l1")
+def tsgen2_pipeline_l1(
+    plan: Path = typer.Option(..., "--plan"),
+    run_dir: Path = typer.Option(..., "--run-dir"),
+    submit: bool = typer.Option(False, "--submit"),
+    outdir: Optional[Path] = typer.Option(None, "--outdir"),
+    profile: str = typer.Option("medium", "--profile"),
+    sbatch_template: str = typer.Option("single_orca_job.sbatch.j2", "--sbatch-template"),
+    validate_only: bool = typer.Option(False, "--validate-only"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+):
+    """Render TSGen2 L1 jobs from the latest L0 TSGenCandidateBatch, optionally submitting jobs."""
+    from labtools.pipeline.builtin import OrcaSubmitStage
+    from labtools.tsgen.pipeline_stages import TSGenL1RenderStage
+
+    plan = plan.expanduser().resolve()
+    run_dir = run_dir.expanduser().resolve()
+    cfg = _pipeline_config(run_dir)
+    cfg.update(
+        {
+            "plan": str(plan),
+            "outdir": str(outdir.expanduser().resolve()) if outdir else None,
+            "submit": bool(submit),
+            "profile": profile,
+            "sbatch_template": sbatch_template,
+            "validate_only": bool(validate_only),
+            "dry_run": bool(dry_run),
+        }
+    )
+
+    stages: List[Any] = [TSGenL1RenderStage()]
+    if submit:
+        stages.append(OrcaSubmitStage())
+
+    pipeline_name = "tsgen2_l1_render" + ("_submit" if submit else "")
+    result = _make_pipeline_run(run_dir, stages=stages, config=cfg, name=pipeline_name).run(resume=False)
+    if result.get("ok"):
+        typer.secho(f"OK: run_dir={run_dir}", fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+
+
+@tsgen2_app.command("pipeline-l2")
+def tsgen2_pipeline_l2(
+    plan: Path = typer.Option(..., "--plan"),
+    run_dir: Path = typer.Option(..., "--run-dir"),
+    submit: bool = typer.Option(False, "--submit"),
+    outdir: Optional[Path] = typer.Option(None, "--outdir"),
+    profile: str = typer.Option("medium", "--profile"),
+    sbatch_template: str = typer.Option("single_orca_job.sbatch.j2", "--sbatch-template"),
+    validate_only: bool = typer.Option(False, "--validate-only"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+):
+    """Render TSGen2 L2 jobs from the latest L1 TSGenCandidateBatch, optionally submitting jobs."""
+    from labtools.pipeline.builtin import OrcaSubmitStage
+    from labtools.tsgen.pipeline_stages import TSGenL2RenderStage
+
+    plan = plan.expanduser().resolve()
+    run_dir = run_dir.expanduser().resolve()
+    cfg = _pipeline_config(run_dir)
+    cfg.update(
+        {
+            "plan": str(plan),
+            "outdir": str(outdir.expanduser().resolve()) if outdir else None,
+            "submit": bool(submit),
+            "profile": profile,
+            "sbatch_template": sbatch_template,
+            "validate_only": bool(validate_only),
+            "dry_run": bool(dry_run),
+        }
+    )
+
+    stages: List[Any] = [TSGenL2RenderStage()]
+    if submit:
+        stages.append(OrcaSubmitStage())
+
+    pipeline_name = "tsgen2_l2_render" + ("_submit" if submit else "")
+    result = _make_pipeline_run(run_dir, stages=stages, config=cfg, name=pipeline_name).run(resume=False)
+    if result.get("ok"):
+        typer.secho(f"OK: run_dir={run_dir}", fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+@tsgen2_app.command("promote-l1")
+def tsgen2_promote_l1(
+    plan: Path = typer.Option(..., "--plan"),
+    run_dir: Path = typer.Option(..., "--run-dir"),
+    max_promote: int = typer.Option(0, "--max-promote", help="Maximum L1 candidates to promote; 0 promotes all survivors."),
+    debug: bool = typer.Option(False, "--debug"),
+):
+    """Collect completed L1 jobs and emit a TSGenCandidateBatch artifact for L2."""
+    from labtools.pipeline.builtin import OrcaCollectStage
+    from labtools.tsgen.pipeline_stages import TSGenL1PromoteStage
+
+    plan = plan.expanduser().resolve()
+    run_dir = run_dir.expanduser().resolve()
+    cfg = _pipeline_config(run_dir)
+    cfg["plan"] = str(plan)
+    cfg["max_promote"] = int(max_promote)
+    cfg["l1_max_promote"] = int(max_promote)
+    cfg["debug"] = bool(debug)
+
+    stages: List[Any] = [OrcaCollectStage(), TSGenL1PromoteStage()]
+    result = _make_pipeline_run(run_dir, stages=stages, config=cfg, name="tsgen2_l1_promote").run(resume=False)
+    if result.get("ok"):
+        typer.secho(f"OK: run_dir={run_dir}", fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+@tsgen2_app.command("promote-l2")
+def tsgen2_promote_l2(
+    run_dir: Path = typer.Option(..., "--run-dir"),
+    max_promote: int = typer.Option(0, "--max-promote", help="Maximum L2 candidates to promote; 0 promotes all survivors."),
+    debug: bool = typer.Option(False, "--debug"),
+    require_one_imag: bool = typer.Option(True, "--require-one-imag/--no-require-one-imag"),
+):
+    """Collect completed L2 jobs and emit a TSGenCandidateBatch artifact for verification."""
+    from labtools.pipeline.builtin import OrcaCollectStage
+    from labtools.tsgen.pipeline_stages import TSGenL2PromoteStage
+
+    run_dir = run_dir.expanduser().resolve()
+    cfg = _pipeline_config(run_dir)
+    cfg["max_promote"] = int(max_promote)
+    cfg["l2_max_promote"] = int(max_promote)
+    cfg["debug"] = bool(debug)
+    cfg["require_one_imag"] = bool(require_one_imag)
+
+    stages: List[Any] = [OrcaCollectStage(), TSGenL2PromoteStage()]
+    result = _make_pipeline_run(run_dir, stages=stages, config=cfg, name="tsgen2_l2_promote").run(resume=False)
+    if result.get("ok"):
+        typer.secho(f"OK: run_dir={run_dir}", fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+@tsgen2_app.command("verify")
+def tsgen2_verify(
+    run_dir: Path = typer.Option(..., "--run-dir"),
+    mode: str = typer.Option("exploratory", "--mode", help="Only 'exploratory' is currently implemented."),
+    require_one_imag: bool = typer.Option(True, "--require-one-imag/--no-require-one-imag"),
+    min_abs_imag_cm1: Optional[float] = typer.Option(None, "--min-abs-imag-cm1"),
+    max_abs_imag_cm1: Optional[float] = typer.Option(None, "--max-abs-imag-cm1"),
+):
+    """Verify promoted L2 candidates using exploratory TS-like criteria only."""
+    from labtools.tsgen.pipeline_stages import TSGenVerifyStage
+
+    run_dir = run_dir.expanduser().resolve()
+    cfg = _pipeline_config(run_dir)
+    cfg["mode"] = str(mode).strip().lower()
+    cfg["require_one_imag"] = bool(require_one_imag)
+    cfg["min_abs_imag_cm1"] = min_abs_imag_cm1
+    cfg["max_abs_imag_cm1"] = max_abs_imag_cm1
+
+    stages: List[Any] = [TSGenVerifyStage()]
+    result = _make_pipeline_run(run_dir, stages=stages, config=cfg, name="tsgen2_verify").run(resume=False)
+    if result.get("ok"):
+        typer.secho(f"OK: run_dir={run_dir}", fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
+        raise typer.Exit(1)
 # Helper Utilities
 # ==========================================================
 
@@ -869,40 +1131,10 @@ def gjf_to_xyz_cmd(
 # ORCA Tools
 # ==========================================================
 
-
-@app.command("orca-info")
-def cli_orca_info(path: Path):
-    info = collect_job_record(path)
-    typer.echo(json.dumps(info, indent=2))
-
-
-@app.command("orca-make-queues")
-def cli_orca_make_queues(
-    jsonl_path: Path,
-    imag_list: Optional[Path] = None,
-    failed_list: Optional[Path] = None,
-    out_csv: Optional[Path] = None,
-):
-    jsonl_path = jsonl_path.expanduser().resolve()
-    n_rows, n_imag, n_failed = make_queues(
-        jsonl_path=jsonl_path,
-        imag_list=imag_list,
-        failed_list=failed_list,
-        out_csv=out_csv,
-    )
-    typer.secho(f"Classified {n_rows} jobs (imag={n_imag}, failed={n_failed})", fg=typer.colors.GREEN)
-
-
 @app.command("orca-nudge-imag")
 def cli_orca_nudge_imag(list_path: Path, step: float = 0.1):
     list_path = list_path.expanduser().resolve()
     nudge_ifreq_jobs(list_path, step=step)
-
-
-@app.command("orca-rebuild-failed")
-def cli_orca_rebuild_failed(list_path: Path):
-    list_path = list_path.expanduser().resolve()
-    rebuild_failed_jobs(list_path)
 
 
 # ==========================================================
@@ -927,235 +1159,33 @@ def results_csv(jsonl_path: Path, out_csv: Path):
 
 
 # ==========================================================
-# Provenance
-# ==========================================================
-
-
-def _resolve_capture_snapshot_fn():
-    for name in ("capture_snapshot", "make_snapshot", "get_snapshot", "snapshot", "build_provenance"):
-        fn = getattr(snap_mod, name, None)
-        if callable(fn):
-            return fn
-
-    import hashlib
-    import platform
-    import sys
-
-    try:
-        import importlib.metadata as importlib_metadata
-    except Exception:  # pragma: no cover
-        import importlib_metadata  # type: ignore
-
-    def _fallback():
-        pkg = "labtools"
-        try:
-            ver = importlib_metadata.version(pkg)
-        except Exception:
-            ver = None
-        env = {k: v for k, v in os.environ.items() if k.startswith(("SLURM_", "EBROOT", "CC_", "PBS_"))}
-        rec = {
-            "host": platform.node(),
-            "system": {"platform": platform.platform(), "python": sys.version},
-            "package": {"name": pkg, "version": ver},
-            "env": env,
-        }
-        rec["env_hash"] = hashlib.sha256(json.dumps(rec, sort_keys=True).encode()).hexdigest()[:16]
-        return rec
-
-    return _fallback
-
-
-CAPTURE_SNAPSHOT_FN = _resolve_capture_snapshot_fn()
-
-
-@app.command("prov-snapshot")
-def prov_snapshot(out: Optional[Path] = None):
-    prov = CAPTURE_SNAPSHOT_FN()
-    if out:
-        out.write_text(json.dumps(prov, indent=2), encoding="utf-8")
-        typer.secho(f"Wrote {out}", fg=typer.colors.GREEN)
-    else:
-        typer.echo(json.dumps(prov, indent=2))
-
-
-# ==========================================================
-# Energetic Span
-# ==========================================================
-
-
-def _resolve_energetic_span_fn():
-    for name in ("energetic_span", "compute_energetic_span", "compute_span", "calc_energetic_span"):
-        fn = getattr(es_mod, name, None)
-        if callable(fn):
-            return fn
-    raise RuntimeError("Could not find energetic-span function")
-
-
-ES_FN = _resolve_energetic_span_fn()
-
-
-@app.command("es")
-def energetic_span_cmd(csv_path: Path, out_csv: Optional[Path] = None):
-    df = _pd.read_csv(csv_path)
-    span_df = ES_FN(df)
-    if out_csv:
-        out_csv.parent.mkdir(parents=True, exist_ok=True)
-        span_df.to_csv(out_csv, index=False)
-        typer.secho(f"Wrote {out_csv}", fg=typer.colors.GREEN)
-    else:
-        typer.echo(span_df.to_string(index=False))
-
-
-# ==========================================================
-# render-plan (legacy)
-# ==========================================================
-
-
-@app.command("render-plan")
-def render_plan_cmd(
-    plan: Path = typer.Option(..., "--plan"),
-    out: Optional[Path] = typer.Option(None, "--outdir"),
-    only: List[str] = typer.Option(None, "--only"),
-    overwrite: bool = False,
-):
-    out = out or Path("build/inputs")
-    wanted = None
-    if only:
-        expanded: List[str] = []
-        for entry in only:
-            expanded.extend(v for v in entry.split(",") if v)
-        wanted = expanded
-    if render_plan_jobs is None:
-        raise typer.BadParameter(
-            "Legacy 'render-plan' is unavailable (render_plan_jobs missing). "
-            "Use: forge plan render --plan <plan.jsonl> --outdir <dir>"
-        )
-    written = render_plan_jobs(plan.expanduser().resolve(), out, only=wanted, overwrite=overwrite)
-    typer.echo(f"Rendered {len(written)} inputs → {out}")
-
-
-# ==========================================================
-# PREP
-# ==========================================================
-
-JOB_TEMPLATES = {
-    "optfreq": "orca_optfreq.inp.j2",
-    "sp-triplet": "orca_sp_triplet.inp.j2",
-    "nmr": "orca_nmr.inp.j2",
-}
-
-
-@app.command("prep")
-def prep(
-    job_type: str,
-    name: str,
-    charge: int,
-    multiplicity: int,
-    geometry_file: Optional[Path] = None,
-    geometry_literal: Optional[str] = None,
-    set: List[str] = typer.Option(None, "--set"),
-    time_str: str = "24:00:00",
-    cpus_per_task: int = 8,
-    mem: str = "16G",
-):
-    jt = job_type.strip().lower()
-    if jt not in JOB_TEMPLATES:
-        raise typer.BadParameter(f"Unknown job_type '{jt}'")
-    tpl_inp = JOB_TEMPLATES[jt]
-    jobdir = Path(f"{_sanitize_name(name)}_{jt}")
-    jobdir.mkdir(parents=True, exist_ok=True)
-
-    params: Dict[str, Any] = {"charge": charge, "multiplicity": multiplicity, "pal": cpus_per_task}
-
-    if set:
-        for kv in set:
-            if "=" not in kv:
-                raise typer.BadParameter(f"Bad --set '{kv}'")
-            k, v = kv.split("=", 1)
-            params[k.strip()] = _coerce_value(v.strip())
-
-    gb = _load_geometry_block(geometry_file, geometry_literal)
-    if gb is None:
-        raise typer.BadParameter("Geometry required.")
-    params["geometry_block"] = gb
-
-    inp_path = jobdir / f"{jt}.inp"
-    render_template(tpl_inp, inp_path, params)
-
-    orca_cmd = f'${{EBROOTORCA}}/orca "{inp_path.name}" > "{jt}.out"'
-
-    sbatch_path = jobdir / "job.sbatch"
-    from labtools.slurm.render import render_template as _rt
-
-    _rt(
-        _repo_templates_root() / "sbatch" / "single_orca_job.sbatch.j2",
-        sbatch_path,
-        {
-            "job_name": jobdir.name,
-            "time": time_str,
-            "cpus_per_task": cpus_per_task,
-            "mem": mem,
-            "inp_basename": inp_path.name,
-            "out_basename": f"{jt}.out",
-            "orca_cmd": orca_cmd,
-        },
-    )
-
-    prov = {
-        "schema": "forge.provenance/1",
-        "created_at": datetime.datetime.utcnow().isoformat() + "Z",
-        "job": {
-            "job_type": jt,
-            "job_name": jobdir.name,
-            "base_name": name,
-            "charge": charge,
-            "multiplicity": multiplicity,
-            "time_limit": time_str,
-            "cpus_per_task": cpus_per_task,
-            "mem": mem,
-        },
-        "inputs": {
-            "plan": None,
-            "template": tpl_inp,
-            "geometry_file": str(geometry_file) if geometry_file else None,
-            "geometry_literal": bool(geometry_literal),
-            "extra_params": {k: v for k, v in params.items() if k != "geometry_block"},
-        },
-        "paths": {
-            "jobdir": str(jobdir.resolve()),
-            "inp": inp_path.name,
-            "sbatch": "job.sbatch",
-        },
-    }
-
-    try:
-        (jobdir / "provenance.json").write_text(json.dumps(prov, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-    typer.secho(f"Prepared {jobdir}/", fg=typer.colors.GREEN)
-
-
-# ==========================================================
 # SUBMIT
 # ==========================================================
 
 
-@app.command("submit")
-def submit_job(
-    inp: Path,
-    profile: str = "medium",
-    job_name: Optional[str] = None,
-    cwd: Optional[Path] = None,
-    job_chdir: Optional[Path] = None,
-    validate_only: bool = False,
+@submit_app.command("single-job")
+def submit_single_job(
+    inp: Path = typer.Argument(..., help="Path to a single ORCA input file, usually job.inp."),
+    profile: str = typer.Option("medium", "--profile"),
+    job_name: Optional[str] = typer.Option(None, "--job-name"),
+    cwd: Optional[Path] = typer.Option(None, "--cwd", help="Directory from which sbatch is called."),
+    job_chdir: Optional[Path] = typer.Option(
+        None,
+        "--job-chdir",
+        help="Directory used as the SLURM job working directory.",
+    ),
+    validate_only: bool = typer.Option(False, "--validate-only"),
 ):
+    """Submit one rendered ORCA job."""
     inp = inp.expanduser().resolve()
-    jobdir = inp.parent
-    cwd = cwd or jobdir
-    job_chdir = job_chdir or jobdir
+    if not inp.is_file():
+        raise typer.BadParameter(f"Input file not found: {inp}")
 
-    dispatch(
+    jobdir = inp.parent
+    cwd = cwd.expanduser().resolve() if cwd else jobdir
+    job_chdir = job_chdir.expanduser().resolve() if job_chdir else jobdir
+
+    job_id = dispatch(
         inp,
         mode="job",
         profile=profile,
@@ -1165,28 +1195,41 @@ def submit_job(
         validate_only=validate_only,
     )
 
+    if validate_only:
+        typer.secho("Submit validation succeeded.", fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"Submitted job {job_id}.", fg=typer.colors.GREEN)
 
-@app.command("submit-array")
-def submit_array(
-    parents: List[Path],
-    profile: str = "medium",
-    job_name: Optional[str] = None,
-    cwd: Optional[Path] = None,
-    job_chdir: Optional[Path] = None,
-    validate_only: bool = False,
+
+@submit_app.command("array")
+def submit_array_jobs(
+    parents: List[Path] = typer.Argument(..., help="One or more directories containing *.inp files."),
+    profile: str = typer.Option("medium", "--profile"),
+    job_name: Optional[str] = typer.Option(None, "--job-name"),
+    cwd: Optional[Path] = typer.Option(None, "--cwd", help="Directory from which sbatch is called."),
+    job_chdir: Optional[Path] = typer.Option(
+        None,
+        "--job-chdir",
+        help="Directory used as the SLURM array working directory.",
+    ),
+    validate_only: bool = typer.Option(False, "--validate-only"),
 ):
+    """Submit all *.inp files found directly inside one or more parent directories as a SLURM array."""
+    resolved_parents = [p.expanduser().resolve() for p in parents]
+
     paths: List[Path] = []
-    for parent in parents:
-        parent = parent.expanduser().resolve()
+    for parent in resolved_parents:
+        if not parent.is_dir():
+            raise typer.BadParameter(f"Not a directory: {parent}")
         paths.extend(sorted(parent.glob("*.inp")))
 
     if not paths:
         raise typer.BadParameter("No *.inp files found")
 
-    cwd = cwd or parents[0].resolve()
-    job_chdir = job_chdir or parents[0].resolve()
+    cwd = cwd.expanduser().resolve() if cwd else resolved_parents[0]
+    job_chdir = job_chdir.expanduser().resolve() if job_chdir else resolved_parents[0]
 
-    dispatch(
+    job_id = dispatch(
         paths,
         mode="array",
         profile=profile,
@@ -1196,22 +1239,28 @@ def submit_array(
         validate_only=validate_only,
     )
 
-    typer.secho(f"Submitted array ({len(paths)} inputs)", fg=typer.colors.GREEN)
+    if validate_only:
+        typer.secho(f"Array validation succeeded for {len(paths)} input(s).", fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"Submitted array {job_id} with {len(paths)} input(s).", fg=typer.colors.GREEN)
 
 
-@app.command("submit-drone")
-def submit_drone(
+@submit_app.command("drone")
+def submit_drone_workers(
     queue_dir: Path = typer.Option(..., "--queue-dir"),
-    n: int = typer.Option(1),
-    profile: str = typer.Option("medium"),
-    nprocs: int = typer.Option(8),
-    mem_per_cpu: str = typer.Option("4G"),
-    time: str = typer.Option("00:10:00"),
+    n: int = typer.Option(1, "--n"),
+    profile: str = typer.Option("medium", "--profile"),
+    nprocs: int = typer.Option(8, "--nprocs"),
+    mem_per_cpu: str = typer.Option("4G", "--mem-per-cpu"),
+    time: str = typer.Option("00:10:00", "--time"),
     validate_only: bool = typer.Option(False, "--validate-only"),
 ):
+    """Submit one or more FORGE drone workers for a queue directory."""
     from labtools.slurm.render import render_template as _render_template
 
-    queue_dir = queue_dir.resolve()
+    queue_dir = queue_dir.expanduser().resolve()
+    if not queue_dir.is_dir():
+        raise typer.BadParameter(f"Queue directory not found: {queue_dir}")
 
     def _find_tpl(rel: str) -> Path:
         here = Path(__file__).resolve()
@@ -1223,17 +1272,19 @@ def submit_drone(
 
     tpl = _find_tpl("drone_worker.sbatch.j2")
 
-    for i in range(n):
-        name = f"drone-{i+1}" if n > 1 else "drone"
+    submitted: List[str] = []
+    for i in range(int(n)):
+        name = f"drone-{i + 1}" if int(n) > 1 else "drone"
 
         params = {
             "job_name": name,
             "jobdir": str(queue_dir),
             "time": time,
-            "nprocs": nprocs,
+            "nprocs": int(nprocs),
             "mem_per_cpu": mem_per_cpu,
             "QUEUE_DIR": str(queue_dir),
             "SLEEP_SECS": 60,
+            "profile": profile,
         }
 
         if validate_only:
@@ -1243,7 +1294,15 @@ def submit_drone(
 
         sbatch_path = queue_dir / f"{name}.sbatch"
         _render_template(tpl, sbatch_path, params)
-        subprocess.run(["sbatch", str(sbatch_path)], check=True)
+        res = subprocess.run(["sbatch", str(sbatch_path)], check=True, capture_output=True, text=True)
+        submitted.append(res.stdout.strip())
+
+    if validate_only:
+        typer.secho("Drone submit validation succeeded.", fg=typer.colors.GREEN)
+    else:
+        for line in submitted:
+            typer.echo(line)
+        typer.secho(f"Submitted {len(submitted)} drone worker(s).", fg=typer.colors.GREEN)
 
 
 # ==========================================================
@@ -1277,11 +1336,33 @@ def plan_from_csv(
 
     rows = read_csv_rows(csv_path)
 
+    fanout_cfg = mapping_spec.get("fanout") or {}
+    if not isinstance(fanout_cfg, dict):
+        fanout_cfg = {}
+    fanout_axes = axis_paths_from_mapping(mapping, mapping_spec)
+    fanout_id_template = (
+        mapping_spec.get("fanout_id_template")
+        or fanout_cfg.get("id_template")
+        or fanout_cfg.get("id_suffix_template")
+    )
+
+    base_jobs: List[Dict[str, Any]] = [row_to_job(row, mapping) for row in rows]
+    alias_maps = collect_fanout_aliases(
+        base_jobs,
+        axis_paths=fanout_axes,
+        fanout_cfg=fanout_cfg,
+    )
+
     jobs: List[Dict[str, Any]] = []
-    for row in rows:
-        job_doc = row_to_job(row, mapping)
-        axes = gather_axes(job_doc, mapping_spec.get("axes", []))
-        expanded = expand_zip(job_doc, axes) if mode == "zip" else expand_product(job_doc, axes)
+    for job_doc in base_jobs:
+        expanded = expand_job_fanout(
+            job_doc,
+            axis_paths=fanout_axes,
+            mode=mode,
+            id_field=id_field,
+            id_template=fanout_id_template,
+            alias_maps=alias_maps,
+        )
         jobs.extend(expanded)
 
     if not jobs:
@@ -1318,11 +1399,18 @@ def plan_from_csv(
 
         if dry_run:
             typer.echo(text or "")
+            if alias_maps:
+                typer.echo(json.dumps({"fanout_aliases": alias_maps}, indent=2))
         else:
+            if alias_maps:
+                alias_path = outdir / "fanout_aliases.json"
+                alias_path.write_text(json.dumps(alias_maps, indent=2) + "\n", encoding="utf-8")
             typer.secho(
                 f"Wrote {len(entries)} PlanEntries → {outpath}",
                 fg=typer.colors.GREEN,
             )
+            if alias_maps:
+                typer.secho(f"Wrote fanout aliases → {outdir / 'fanout_aliases.json'}", fg=typer.colors.GREEN)
         return
 
     written = emit_job_yaml_files(
@@ -1334,9 +1422,14 @@ def plan_from_csv(
             "csv": str(csv_path),
             "mapping": str(mapping_path),
             "mode": mode,
+            "fanout_aliases": alias_maps,
         },
         dry_run=dry_run,
     )
+
+    if alias_maps and not dry_run:
+        alias_path = outdir / "fanout_aliases.json"
+        alias_path.write_text(json.dumps(alias_maps, indent=2) + "\n", encoding="utf-8")
 
     if dry_run:
         typer.echo("\n---\n".join(written or []))
@@ -1952,45 +2045,28 @@ from typing import Tuple
 
 
 def _read_xyz_geom_lines(xyz_path: Path) -> List[str]:
-    xyz_path = xyz_path.expanduser().resolve()
-    if not xyz_path.is_file():
-        raise typer.BadParameter(f"XYZ file not found: {xyz_path}")
-    lines = xyz_path.read_text(encoding="utf-8").splitlines()
-    if len(lines) >= 3:
-        try:
-            int(lines[0].strip())
-            return [ln.rstrip() for ln in lines[2:] if ln.strip()]
-        except Exception:
-            pass
-    return [ln.rstrip() for ln in lines if ln.strip()]
+    try:
+        return single_job.read_xyz_geom_lines(xyz_path)
+    except FileNotFoundError as e:
+        raise typer.BadParameter(str(e)) from e
 
 
 def _orca_template_for_task(task: str) -> Path:
-    task = task.strip().lower()
-    root = _templates_root() / "orca"
-    mapping = {
-        "sp": "orca_sp.inp.j2",
-        "opt": "orca_opt.inp.j2",
-        "freq": "orca_freq.inp.j2",
-        "optfreq": "orca_optfreq.inp.j2",
-    }
-    if task not in mapping:
-        raise typer.BadParameter(f"Unsupported task: {task}. Choose from: {', '.join(sorted(mapping))}")
-    tpl = root / mapping[task]
-    if not tpl.is_file():
-        raise typer.BadParameter(f"Template not found for task '{task}': {tpl}")
-    return tpl
+    try:
+        return single_job.orca_template_for_task(task, templates_root=_templates_root())
+    except (FileNotFoundError, ValueError) as e:
+        raise typer.BadParameter(str(e)) from e
 
 
 def _sbatch_template() -> Path:
-    tpl = _templates_root() / "sbatch" / "single_orca_job.sbatch.j2"
-    if not tpl.is_file():
-        raise typer.BadParameter(f"SBATCH template not found: {tpl}")
-    return tpl
+    try:
+        return single_job.sbatch_template(templates_root=_templates_root())
+    except FileNotFoundError as e:
+        raise typer.BadParameter(str(e)) from e
 
 
 def _default_job_name_from_xyz(xyz: Path, task: str) -> str:
-    return f"{xyz.stem}_{task}"
+    return single_job.default_job_name_from_xyz(xyz, task)
 
 
 def _build_minimal_payload(
@@ -2005,65 +2081,38 @@ def _build_minimal_payload(
     restart_flags: List[str],
     nprocs: Optional[int],
     maxcore_mb: Optional[int],
-    time: Optional[int],
+    time: Optional[str],
     maxiter: Optional[int],
     cpcm_eps: Optional[float],
     cpcm_refrac: Optional[float],
 ) -> Dict[str, Any]:
-    geom_lines = _read_xyz_geom_lines(xyz)
-
-    geom = {
-        "maxiter": int(maxiter) if maxiter is not None else 200,
-        "constraints": [],
-        "restart": False,
-        "Restart": False,
-    }
-
-    payload: Dict[str, Any] = {
-        "task": task,
-        "method": method,
-        "basis": (basis or ""),
-        "flags": list(flags or []),
-        "restart_flags": list(restart_flags or []),
-        "pal": int(nprocs) if nprocs is not None else None,
-        "maxcore_mb": int(maxcore_mb) if maxcore_mb is not None else 2000,
-        "scf": {},
-        "geom": geom,
-        "freq": {"override": {}},
-        "cpcm": None,
-        "charge": int(charge),
-        "mult": int(mult),
-        "geom_lines": geom_lines,
-        # explicit defaults for template compatibility
-        "restart": {"enabled": False, "file": None, "flags": []},
-    }
-
-    if cpcm_eps is not None:
-        payload["cpcm"] = {
-            "epsilon": float(cpcm_eps),
-            "refrac": float(cpcm_refrac) if cpcm_refrac is not None else None,
-        }
-
-    return payload
-
+    try:
+        return single_job.build_minimal_payload(
+            xyz=xyz,
+            task=task,
+            method=method,
+            charge=charge,
+            mult=mult,
+            basis=basis,
+            flags=flags,
+            restart_flags=restart_flags,
+            nprocs=nprocs,
+            maxcore_mb=maxcore_mb,
+            time=time,
+            maxiter=maxiter,
+            cpcm_eps=cpcm_eps,
+            cpcm_refrac=cpcm_refrac,
+        )
+    except FileNotFoundError as e:
+        raise typer.BadParameter(str(e)) from e
 
 
 def _mem_per_cpu_from_maxcore(maxcore_mb: Optional[int]) -> str:
-    # Minimal deterministic default for SLURM --mem-per-cpu (string like "4G").
-    # If maxcore_mb is unset, fall back to 4G.
-    if maxcore_mb is None:
-        return "4G"
-    gb = (int(maxcore_mb) + 1023) // 1024  # ceil(MB/1024)
-    gb = max(1, gb)
-    return f"{gb}G"
+    return single_job.mem_per_cpu_from_maxcore(maxcore_mb)
+
 
 def _safe_clear_dir(d: Path) -> None:
-    import shutil
-    for child in d.iterdir():
-        if child.is_dir():
-            shutil.rmtree(child)
-        else:
-            child.unlink()
+    single_job.safe_clear_dir(d)
 
 
 def _write_job_dir(
@@ -2080,57 +2129,24 @@ def _write_job_dir(
     mem_per_cpu: str,
     exists: str,
 ) -> None:
-    import tempfile
-    import shutil
-
-    if final_dir.exists():
-        if exists == "fail":
-            raise typer.BadParameter(f"Job directory already exists: {final_dir}")
-        if exists == "skip":
-            return
-        if exists == "overwrite":
-            _safe_clear_dir(final_dir)
-        else:
-            raise typer.BadParameter("--exists must be one of: fail|skip|overwrite")
-    else:
-        final_dir.parent.mkdir(parents=True, exist_ok=True)
-
-    tmp_root = Path(tempfile.mkdtemp(prefix=f".tmp_{job_name}_", dir=str(final_dir.parent)))
     try:
-        tpl = _orca_template_for_task(task)
-        inp_text = render_template(tpl, tmp_root / "job.inp", payload, return_text=True)
-        (tmp_root / "job.inp").write_text(inp_text or "", encoding="utf-8")
-        (tmp_root / "plan_entry.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-
-        if xyz is not None:
-            xyz = xyz.expanduser().resolve()
-            if xyz.is_file():
-                shutil.copy2(xyz, tmp_root / xyz.name)
-
-        if write_sbatch:
-            sbatch_params = {
-                "job_dir": str(final_dir),
-                "job_name": job_name,
-                "nprocs": int(nprocs or 1),
-                "time": walltime,
-                "mem_per_cpu": mem_per_cpu,
-                "SRC_DIR": str(final_dir),
-                "inp_basename": "job.inp",
-                "orca_cmd": '${EBROOTORCA}/orca "${INP_BN}" > "job.out"',
-            }
-            sb_text = render_template(_sbatch_template(), tmp_root / "job.sbatch", sbatch_params, return_text=True)
-            (tmp_root / "job.sbatch").write_text(sb_text or "", encoding="utf-8")
-
-        if write_ready:
-            (tmp_root / "READY").write_text("", encoding="utf-8")
-
-        # atomic-ish move
-        if final_dir.exists() and exists == "overwrite":
-            _safe_clear_dir(final_dir)
-        tmp_root.replace(final_dir)
-    finally:
-        if tmp_root.exists() and tmp_root != final_dir:
-            shutil.rmtree(tmp_root, ignore_errors=True)
+        single_job.write_job_dir(
+            final_dir=final_dir,
+            payload=payload,
+            task=task,
+            job_name=job_name,
+            xyz=xyz,
+            write_ready=write_ready,
+            write_sbatch=write_sbatch,
+            nprocs=nprocs,
+            walltime=walltime,
+            mem_per_cpu=mem_per_cpu,
+            exists=exists,
+            templates_root=_templates_root(),
+            render_template_fn=render_template,
+        )
+    except (FileExistsError, FileNotFoundError, ValueError) as e:
+        raise typer.BadParameter(str(e)) from e
 
 
 @job_app.command("create")
@@ -2186,25 +2202,27 @@ def job_create(
     mpc = mem_per_cpu or _mem_per_cpu_from_maxcore(maxcore_mb)
 
     if dry_run:
-        tpl = _orca_template_for_task(task)
-        render_template(tpl, Path("/dev/null"), payload, return_text=True)
-        if write_sbatch:
-            render_template(
-                _sbatch_template(),
-                Path("/dev/null"),
-                {
-                    "job_dir": str(final_dir),
-                    "job_name": job_name,
-                    "nprocs": int(nprocs or 1),
-                    "time": time,
-                    "mem_per_cpu": mpc,
-                    "SRC_DIR": str(final_dir),
-                    "inp_basename": "job.inp",
-                    "orca_cmd": '${EBROOTORCA}/orca "${INP_BN}" > "job.out"',
-                },
-                return_text=True,
-            )
-        typer.secho("Dry-run OK: templates rendered successfully.", fg=typer.colors.GREEN)
+        try:
+            single_job.validate_job_input_render(payload=payload, task=task, xyz=xyz)
+            if write_sbatch:
+                render_template(
+                    _sbatch_template(),
+                    Path("/dev/null"),
+                    {
+                        "job_dir": str(final_dir),
+                        "job_name": job_name,
+                        "nprocs": int(nprocs or 1),
+                        "time": time,
+                        "mem_per_cpu": mpc,
+                        "SRC_DIR": str(final_dir),
+                        "inp_basename": "job.inp",
+                        "orca_cmd": '${EBROOTORCA}/orca "${INP_BN}" > "job.out"',
+                    },
+                    return_text=True,
+                )
+        except Exception as e:
+            raise typer.BadParameter(str(e)) from e
+        typer.secho("Dry-run OK: canonical ORCA renderer succeeded.", fg=typer.colors.GREEN)
         return
 
     _write_job_dir(
@@ -2224,8 +2242,24 @@ def job_create(
     typer.secho(f"Created job → {final_dir}", fg=typer.colors.GREEN)
 
     if submit:
-        dispatch(str(final_dir))
-        typer.secho("Submitted job.", fg=typer.colors.GREEN)
+        job_id = dispatch(
+            final_dir / "job.inp",
+            mode="job",
+            job_name=job_name,
+            submit_cwd=final_dir,
+            sbatch_chdir=final_dir,
+            extra_params={
+                "time": time,
+                "nprocs": int(nprocs or 1),
+                "cpus_per_task": int(nprocs or 1),
+                "mem_per_cpu": mpc,
+                "SRC_DIR": str(final_dir),
+                "inp_basename": "job.inp",
+                "orca_cmd": '${EBROOTORCA}/orca "${INP_BN}" > "job.out"',
+                "out_basename": "job.out",
+            },
+        )
+        typer.secho(f"Submitted job {job_id}.", fg=typer.colors.GREEN)
 
 
 @job_app.command("import")
@@ -2255,19 +2289,37 @@ def job_import(
     walltime = "08:00:00"
     mpc = _mem_per_cpu_from_maxcore(int(payload.get("maxcore_mb") or 2000))
 
-    if dry_run:
-        tpl = _orca_template_for_task(task)
-        render_template(tpl, Path("/dev/null"), payload, return_text=True)
-        typer.secho("Dry-run OK: template rendered successfully.", fg=typer.colors.GREEN)
-        return
-
     # attempt to locate structure file if referenced
     xyz = None
-    sp = payload.get("structure") or payload.get("xyz")
+    sp = payload.get("structure") or payload.get("system") or payload.get("xyz")
     if sp:
         p = Path(sp).expanduser()
         if p.is_file():
             xyz = p
+
+    if dry_run:
+        try:
+            single_job.validate_job_input_render(payload=payload, task=task, xyz=xyz)
+            if write_sbatch:
+                render_template(
+                    _sbatch_template(),
+                    Path("/dev/null"),
+                    {
+                        "job_dir": str(final_dir),
+                        "job_name": str(job_name),
+                        "nprocs": int(payload.get("pal") or 1),
+                        "time": walltime,
+                        "mem_per_cpu": mpc,
+                        "SRC_DIR": str(final_dir),
+                        "inp_basename": "job.inp",
+                        "orca_cmd": '${EBROOTORCA}/orca "${INP_BN}" > "job.out"',
+                    },
+                    return_text=True,
+                )
+        except Exception as e:
+            raise typer.BadParameter(str(e)) from e
+        typer.secho("Dry-run OK: canonical ORCA renderer succeeded.", fg=typer.colors.GREEN)
+        return
 
     _write_job_dir(
         final_dir=final_dir,
@@ -2286,8 +2338,24 @@ def job_import(
     typer.secho(f"Imported job → {final_dir}", fg=typer.colors.GREEN)
 
     if submit:
-        dispatch(str(final_dir))
-        typer.secho("Submitted job.", fg=typer.colors.GREEN)
+        job_id = dispatch(
+            final_dir / "job.inp",
+            mode="job",
+            job_name=str(job_name),
+            submit_cwd=final_dir,
+            sbatch_chdir=final_dir,
+            extra_params={
+                "time": walltime,
+                "nprocs": int(payload.get("pal") or 1),
+                "cpus_per_task": int(payload.get("pal") or 1),
+                "mem_per_cpu": mpc,
+                "SRC_DIR": str(final_dir),
+                "inp_basename": "job.inp",
+                "orca_cmd": '${EBROOTORCA}/orca "${INP_BN}" > "job.out"',
+                "out_basename": "job.out",
+            },
+        )
+        typer.secho(f"Submitted job {job_id}.", fg=typer.colors.GREEN)
 
 
 # --------------------------
