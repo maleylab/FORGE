@@ -6,9 +6,7 @@ nprocs {{ pal }}
 end
 {% endif %}
 
-{% if maxcore_mb is defined %}
-%maxcore {{ maxcore_mb }}
-{% endif %}
+%maxcore {{ maxcore_mb | default(2000, true) }}
 
 {% if scf is defined and scf %}
 %scf

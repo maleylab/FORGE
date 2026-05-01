@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lab-tools"
-version = "0.1.0"
-description = "General tools for a computational chemistry lab"
+version = "0.7.0"
+description = "FORGE - Framework for ORCA Run Generation and Execution"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
@@ -20,8 +20,8 @@ dependencies = [
   "jsonschema>=4.23",
 ]
 # Optional extra if you want pyarrow on machines that support it:
-# [project.optional-dependencies]
-# arrow = ["pyarrow>=15"]
+[project.optional-dependencies]
+arrow = ["pyarrow>=15"]
 
 [project.scripts]
 forge = "labtools.cli:app"

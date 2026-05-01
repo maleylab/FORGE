@@ -180,7 +180,7 @@ def render_single_job_orca(job: Dict[str, Any], *, job_dir: Path) -> None:
     elif isinstance(params.get("_row_raw"), dict):
         row = params.get("_row_raw")  # type: ignore[assignment]
 
-    srcs = [row, params, job]
+    srcs = [params, job, row]
 
     def _first(key: str, default=None):
         for s in srcs:

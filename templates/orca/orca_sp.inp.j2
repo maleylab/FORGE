@@ -1,7 +1,6 @@
 ! {{ method }}{% if basis is defined and basis %} {{ basis }}{% endif %} {{ flags | join(' ') }} {{ restart_flags | join(' ') }}
 
-{# --- Maxcore: always present, default 2000 MB --- #}
-%maxcore {{ 2000 if maxcore_mb is none else maxcore_mb }}
+%maxcore {{ maxcore_mb | default(2000, true) }}
 
 {% if pal is defined%}
 %pal

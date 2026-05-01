@@ -6,6 +6,8 @@ import json
 import os
 import re
 import subprocess
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -13,15 +15,27 @@ import pandas as _pd
 import typer
 
 # Chemistry / descriptors
-
+from labtools.chem.descriptors import homo_lumo_gap
 
 # IO helpers
-from labtools.data.io import jsonl_to_parquet
-from labtools.orca.parse import collect_job_record 
-from labtools.orca.nudge_or_rebuild import nudge_ifreq_jobs
+from labtools.data.io import jsonl_append, jsonl_to_parquet
+from labtools.orca.parse import parse_orca_file, collect_job_record 
+from labtools.orca.nudge_or_rebuild import nudge_ifreq_jobs, rebuild_failed_jobs
+from labtools.orca.queues import make_queues
+
+# Provenance
+from labtools.prov import snapshot as snap_mod
 
 # Templates / SLURM rendering
 from labtools.slurm.render import render_template
+
+# Optional legacy helper (older FORGE versions). Keep CLI importable even if missing.
+try:
+    from labtools.slurm.render import render_plan_jobs  # type: ignore
+except Exception:  # pragma: no cover
+    render_plan_jobs = None  # type: ignore
+
+from labtools.slurm.render import render_plan_entrypoint as render_plan
 
 # Submission dispatcher
 from labtools.submit import dispatch
@@ -187,6 +201,10 @@ def tsfp_verify(
 # PlanEntry CLI
 # ==========================================================
 
+
+def _repo_templates_root() -> Path:
+    return Path(__file__).resolve().parents[2] / "templates"
+
 def _templates_root() -> Path:
     """
     Find the *package* templates directory robustly, both in editable installs
@@ -277,9 +295,14 @@ def plan_render_cmd(
 
     typer.secho(f"Rendered {len(entries)} jobs → {outdir}", fg=typer.colors.GREEN)
 
+
+
 # ==========================================================
 # TSGen 2.0
 # ==========================================================
+
+
+
 
 @tsgen2_app.command("init")
 def tsgen2_init(
@@ -371,7 +394,7 @@ def tsgen2_run_autonomous(
     typer.secho("TSGen2 autonomous pipeline completed.", fg=typer.colors.GREEN)
 
 
-@tsgen2_app.command("pipeline-l0", hidden=True)
+@tsgen2_app.command("pipeline-l0")
 def tsgen2_pipeline_l0(
     plan: Path = typer.Option(..., "--plan"),
     run_dir: Path = typer.Option(..., "--run-dir"),
@@ -412,7 +435,7 @@ def tsgen2_pipeline_l0(
         raise typer.Exit(1)
 
 
-@tsgen2_app.command("promote-l0", hidden=True)
+@tsgen2_app.command("promote-l0")
 def tsgen2_promote_l0(
     run_dir: Path = typer.Option(..., "--run-dir"),
     max_promote: int = typer.Option(3, "--max-promote"),
@@ -440,7 +463,7 @@ def tsgen2_promote_l0(
 # ==========================================================
 
 
-@tsgen2_app.command("pipeline-l1", hidden=True)
+@tsgen2_app.command("pipeline-l1")
 def tsgen2_pipeline_l1(
     plan: Path = typer.Option(..., "--plan"),
     run_dir: Path = typer.Option(..., "--run-dir"),
@@ -484,7 +507,7 @@ def tsgen2_pipeline_l1(
 
 
 
-@tsgen2_app.command("pipeline-l2", hidden=True)
+@tsgen2_app.command("pipeline-l2")
 def tsgen2_pipeline_l2(
     plan: Path = typer.Option(..., "--plan"),
     run_dir: Path = typer.Option(..., "--run-dir"),
@@ -525,7 +548,7 @@ def tsgen2_pipeline_l2(
     else:
         typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
         raise typer.Exit(1)
-@tsgen2_app.command("promote-l1", hidden=True)
+@tsgen2_app.command("promote-l1")
 def tsgen2_promote_l1(
     plan: Path = typer.Option(..., "--plan"),
     run_dir: Path = typer.Option(..., "--run-dir"),
@@ -552,7 +575,7 @@ def tsgen2_promote_l1(
         typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
         raise typer.Exit(1)
 
-@tsgen2_app.command("promote-l2", hidden=True)
+@tsgen2_app.command("promote-l2")
 def tsgen2_promote_l2(
     run_dir: Path = typer.Option(..., "--run-dir"),
     max_promote: int = typer.Option(0, "--max-promote", help="Maximum L2 candidates to promote; 0 promotes all survivors."),
@@ -578,7 +601,7 @@ def tsgen2_promote_l2(
         typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
         raise typer.Exit(1)
 
-@tsgen2_app.command("verify", hidden=True)
+@tsgen2_app.command("verify")
 def tsgen2_verify(
     run_dir: Path = typer.Option(..., "--run-dir"),
     mode: str = typer.Option("exploratory", "--mode", help="Only 'exploratory' is currently implemented."),
@@ -603,10 +626,52 @@ def tsgen2_verify(
     else:
         typer.secho(f"FAIL: {result.get('failed_stage')}: {result.get('message')}", fg=typer.colors.RED)
         raise typer.Exit(1)
-
-# ==========================================================
 # Helper Utilities
 # ==========================================================
+
+
+def _get(d: dict, path: str, default=None):
+    cur: Any = d
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(part)
+    return default if cur is None else cur
+
+
+def _slugify(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_")
+
+
+def _sanitize_name(name: str) -> str:
+    return _slugify(name)
+
+
+def _repo_templates_root() -> Path:
+    return Path(__file__).resolve().parents[2] / "templates"
+
+
+def _coerce_value(v: str) -> Any:
+    if v.lower() in ("true", "yes", "on"):
+        return True
+    if v.lower() in ("false", "no", "off"):
+        return False
+    try:
+        return float(v) if "." in v else int(v)
+    except ValueError:
+        return v
+
+
+def _load_geometry_block(geometry_file: Optional[Path], geometry_literal: Optional[str]):
+    if geometry_file:
+        text = geometry_file.read_text(encoding="utf-8").strip().splitlines()
+        if len(text) >= 2 and text[0].isdigit():
+            text = text[2:]
+        return "\n".join(text) + "\n"
+    if geometry_literal:
+        return geometry_literal.replace("\\n", "\n")
+    return None
+
 
 def _flatten_record(d: Dict[str, Any], prefix: str = "", out: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Flatten nested dict/list records into a single dict suitable for CSV.
@@ -646,7 +711,7 @@ def _unlink_if_exists(p: Path) -> None:
         p.unlink()
     except FileNotFoundError:
         return
-    except IsADirectoryError:
+    except (IsADirectoryError, PermissionError):
         return
 
 
@@ -656,7 +721,7 @@ def _set_exclusive_sentinel(job_dir: Path, new_name: str, *, all_names: List[str
       1) removing all sentinels in all_names
       2) touching `new_name`
     '''
-    for nm in all_names:
+    for nm in dict.fromkeys(all_names):
         tgt = job_dir / nm
         if dry_run:
             if tgt.exists():
@@ -670,6 +735,8 @@ def _set_exclusive_sentinel(job_dir: Path, new_name: str, *, all_names: List[str
     else:
         tgt.write_text("", encoding="utf-8")
 
+
+# ==========================================================
 
 # ==========================================================
 # GJF → XYZ helper (Gaussian input from GaussView)
@@ -1160,7 +1227,8 @@ def plan_from_csv(
 # FORGE WATCH (deluxe v1: snapshot-only)
 # ==========================================================
 
-WATCH_SENTINELS = ("READY", "STARTED", "DONE", "FAIL", "GOOD", "BAD")
+COMMON_SENTINELS = ["READY", "STARTED", "DONE", "FAIL", "GOOD", "BAD"]
+WATCH_SENTINELS = tuple(COMMON_SENTINELS)
 
 
 def _watch_state_dir(root: Path) -> Path:
@@ -1745,6 +1813,13 @@ def pipeline_status_cmd(run_dir: Path = typer.Option(..., "--run-dir"), jobs: bo
             for state, n in sorted(counts.items()):
                 typer.echo(f"    {state:<16} {n}")
 
+def main() -> None:
+    app()
+
+
+if __name__ == "__main__":
+    main()
+
 
 # ==========================================================
 # Single-job CLI (create/import) + Operational tooling (scan/mark/clean)
@@ -1842,7 +1917,7 @@ def job_create(
             write_ready=write_ready,
             write_sbatch=write_sbatch,
             nprocs=nprocs,
-            walltime=walltime,
+            walltime=time,
             mem_per_cpu=mpc,
             exists=exists,
             templates_root=_templates_root(),
@@ -1997,7 +2072,7 @@ def _orca_terminated_normally(lines: List[str]) -> bool:
 def _scan_one(job_dir: Path, out_glob: str, ignore_glob: str) -> Dict[str, Any]:
     out_file = _find_out_file(job_dir, out_glob, ignore_glob)
     if out_file is None:
-        return {"path": str(job_dir), "out_file": "", "terminated_normally": False, "opt_done": False, "freq_done": False, "n_imag": "", "status": "FAIL", "fail_reason": "no_out"}
+        return {"path": str(job_dir.resolve()), "out_file": "", "terminated_normally": False, "opt_done": False, "freq_done": False, "n_imag": "", "status": "FAIL", "fail_reason": "no_out"}
 
     lines = out_file.read_text(errors="ignore").splitlines()
     term = _orca_terminated_normally(lines)
@@ -2037,8 +2112,8 @@ def _scan_one(job_dir: Path, out_glob: str, ignore_glob: str) -> Dict[str, Any]:
             reason = "unknown"
 
     return {
-        "path": str(job_dir),
-        "out_file": str(out_file),
+        "path": str(job_dir.resolve()),
+        "out_file": str(out_file.resolve()),
         "terminated_normally": term,
         "opt_done": opt_done,
         "freq_done": freq_done,
@@ -2062,13 +2137,18 @@ def scan_cmd(
         raise typer.BadParameter(f"Not a directory: {root}")
 
     rows: List[Dict[str, Any]] = []
-    for d in sorted([p for p in root.rglob("*") if p.is_dir()]):
+    seen_paths = set()
+    for d in sorted({p.resolve() for p in root.rglob("*") if p.is_dir()}):
         if any(part.startswith(".") for part in d.parts):
             continue
         rec = _scan_one(d, out_glob, ignore_glob)
         if rec["fail_reason"] == "no_out":
             if not (d / "plan_entry.json").exists() and not any(d.glob("*.inp")):
                 continue
+        rp = str(rec.get("path", "")).strip()
+        if rp in seen_paths:
+            continue
+        seen_paths.add(rp)
         rows.append(rec)
 
     if dry_run:
@@ -2078,11 +2158,11 @@ def scan_cmd(
     import csv as _csv
     csv.parent.mkdir(parents=True, exist_ok=True)
     with csv.open("w", newline="", encoding="utf-8") as f:
-        fieldnames = list(rows[0].keys()) if rows else ["path"]
+        fieldnames = sorted({k for r in rows for k in r.keys()}) if rows else ["path"]
         w = _csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in rows:
-            w.writerow(r)
+            w.writerow({k: r.get(k, "") for k in fieldnames})
 
     typer.secho(f"Wrote results → {csv}", fg=typer.colors.GREEN)
 
@@ -2105,12 +2185,15 @@ def mark_cmd(
     for idx, row in df.iterrows():
         raw_status = row.get("status", "")
         status = "" if _pd.isna(raw_status) else str(raw_status).strip().upper()
+        if status not in {"OK", "FAIL"}:
+            continue
 
         raw_path = row.get("path", "")
         if _pd.isna(raw_path):
             continue
-        p = Path(str(raw_path)).expanduser()
+        p = Path(str(raw_path).strip()).expanduser().resolve()
         if not p.is_dir():
+            typer.echo(f"Skipping missing job dir: {p}")
             continue
 
         if status == "OK" and not only_fail:
@@ -2121,7 +2204,7 @@ def mark_cmd(
             continue
 
         # Enforce exclusive state among common sentinels (+ caller-specified good/bad).
-        sentinel_names = list(dict.fromkeys(["READY", "STARTED", "DONE", "FAIL", str(good), str(bad)]))
+        sentinel_names = list(dict.fromkeys(COMMON_SENTINELS + [str(good), str(bad)]))
         try:
             _set_exclusive_sentinel(p, str(new_name), all_names=sentinel_names, dry_run=dry_run)
         except Exception as exc:
@@ -2150,20 +2233,38 @@ def clean_cmd(
 
     cleaned = 0
     for _, row in df.iterrows():
-        status = str(row.get("status", "")).strip().upper()
+        raw_status = row.get("status", "")
+        status = "" if _pd.isna(raw_status) else str(raw_status).strip().upper()
+
+        if status not in {"OK", "FAIL"}:
+            continue
+
         if only_fail and status != "FAIL":
             continue
-        p = Path(str(row["path"]))
+
+        raw_path = row.get("path", "")
+        if _pd.isna(raw_path):
+            continue
+        p = Path(str(raw_path).strip()).expanduser().resolve()
+
         if not p.is_dir():
+            typer.echo(f"Skipping missing job dir: {p}")
             continue
 
         keep_set = set()
         for pat in keep:
             for k in p.glob(pat):
-                keep_set.add(k.resolve())
+                try:
+                    keep_set.add(k.resolve())
+                except Exception:
+                    keep_set.add(k)
 
-        for child in p.iterdir():
-            if child.resolve() in keep_set:
+        for child in list(p.iterdir()):
+            try:
+                child_resolved = child.resolve()
+            except Exception:
+                child_resolved = child
+            if child_resolved in keep_set:
                 continue
             if dry_run:
                 typer.echo(f"Would remove {child}")
@@ -2176,8 +2277,7 @@ def clean_cmd(
 
         if write_ready:
             # Enforce exclusive state: clean implies "READY" (not DONE/FAIL/GOOD/BAD/STARTED).
-            sentinel_names = ["READY", "STARTED", "DONE", "FAIL", "GOOD", "BAD"]
-            _set_exclusive_sentinel(p, "READY", all_names=sentinel_names, dry_run=dry_run)
+            _set_exclusive_sentinel(p, "READY", all_names=COMMON_SENTINELS, dry_run=dry_run)
 
         cleaned += 1
 
@@ -2255,9 +2355,21 @@ def parse_cmd(
             raise typer.BadParameter("--status must be one of: OK|FAIL|ALL")
 
         if want != "ALL":
-            df = df[df["status"].astype(str).str.upper() == want]
+            df = df[
+                df["status"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                == want
+            ]
 
-        paths = [Path(p).expanduser() for p in df["path"].astype(str).tolist()]
+        paths = [
+            Path(str(p).strip()).expanduser().resolve()
+            for p in df["path"].tolist()
+            if not _pd.isna(p) and str(p).strip()
+        ]
+        paths = list(dict.fromkeys(paths))
 
     else:
         root = root.expanduser().resolve()
@@ -2281,7 +2393,7 @@ def parse_cmd(
         else:
             paths = [p for p in candidates if _has_sentinel(p, only)]
 
-        paths = sorted(paths, key=lambda p: str(p))
+        paths = sorted(dict.fromkeys(paths), key=lambda p: str(p))
 
     if limit is not None:
         paths = paths[: int(limit)]
@@ -2301,16 +2413,16 @@ def parse_cmd(
                     continue
                 raise typer.BadParameter(f"Job directory not found: {p}")
 
-            rec = collect_job_record(p)
+            try:
+                rec = collect_job_record(p)
+            except Exception as e:
+                if skip_missing:
+                    typer.echo(f"Skipping unparsable job dir: {p} ({e})")
+                    continue
+                raise
             f.write(json.dumps(rec) + "\n")
             n_written += 1
 
     typer.secho(f"Wrote {n_written} record(s) → {out_jsonl}", fg=typer.colors.GREEN)
 
 
-def main() -> None:
-    app()
-
-
-if __name__ == "__main__":
-    main()
