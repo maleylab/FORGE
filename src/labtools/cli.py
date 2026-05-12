@@ -2069,15 +2069,69 @@ def _orca_terminated_normally(lines: List[str]) -> bool:
     return any("ORCA TERMINATED NORMALLY" in ln for ln in lines)
 
 
+def _job_dir_has_active_sentinel(job_dir: Path) -> bool:
+    """Return True when a job directory is queue/worker-owned.
+
+    scan/mark must not touch READY or STARTED directories because drones may
+    still be queued or actively writing outputs.
+    """
+    return (job_dir / "READY").exists() or (job_dir / "STARTED").exists()
+
+
+def _orca_opt_converged(lines: List[str]) -> bool:
+    """Strict ORCA geometry-optimization success check.
+
+    ORCA can terminate normally even when an optimization has exhausted its
+    allowed cycles. For FORGE marking, GOOD requires the explicit convergence
+    marker, not merely normal process termination or "OPTIMIZATION RUN DONE".
+    """
+    return any("THE OPTIMIZATION HAS CONVERGED" in ln for ln in lines)
+
+
+def _orca_opt_max_cycles_reached(lines: List[str]) -> bool:
+    patterns = (
+        r"maximum number of optimization cycles",
+        r"maximum number of geometry steps",
+        r"optimization.*did not converge",
+        r"geometry optimization.*did not converge",
+    )
+    return any(any(re.search(pat, ln, re.I) for pat in patterns) for ln in lines)
+
+
+def _read_job_input_text(job_dir: Path) -> str:
+    inp = job_dir / "job.inp"
+    if inp.is_file():
+        return inp.read_text(errors="ignore")
+
+    inps = sorted(job_dir.glob("*.inp"))
+    if inps:
+        return inps[0].read_text(errors="ignore")
+
+    return ""
+
+
+def _orca_has_opt_intent(job_dir: Path, lines: List[str]) -> bool:
+    # Prefer the input file because output headers can be truncated or absent.
+    text = _read_job_input_text(job_dir)
+    if not text:
+        text = "\n".join(lines[:120])
+
+    # ORCA simple-input keywords are usually on ! lines, e.g. ! PBE0 Opt Freq.
+    return bool(re.search(r"(?<![A-Za-z])Opt(?:TS)?(?![A-Za-z])", text, re.I))
+
+
 def _scan_one(job_dir: Path, out_glob: str, ignore_glob: str) -> Dict[str, Any]:
     out_file = _find_out_file(job_dir, out_glob, ignore_glob)
     if out_file is None:
-        return {"path": str(job_dir.resolve()), "out_file": "", "terminated_normally": False, "opt_done": False, "freq_done": False, "n_imag": "", "status": "FAIL", "fail_reason": "no_out"}
+        return {"path": str(job_dir.resolve()), "out_file": "", "terminated_normally": False, "opt_done": False, "opt_converged": False, "opt_max_cycles_reached": False, "freq_done": False, "n_imag": "", "status": "FAIL", "fail_reason": "no_out"}
 
     lines = out_file.read_text(errors="ignore").splitlines()
     term = _orca_terminated_normally(lines)
 
-    opt_done = any("OPTIMIZATION RUN DONE" in ln for ln in lines)
+    opt_converged = _orca_opt_converged(lines)
+    opt_max_cycles_reached = _orca_opt_max_cycles_reached(lines)
+    # Backward-compatible column name; now intentionally strict.
+    opt_done = opt_converged
 
     n_imag = None
     for ln in lines:
@@ -2088,15 +2142,8 @@ def _scan_one(job_dir: Path, out_glob: str, ignore_glob: str) -> Dict[str, Any]:
     freq_done = n_imag is not None
 
     # Intent detection
-    head = "\n".join(lines[:80])
-    has_opt_intent = bool(re.search(r"\bOpt\b", head, re.I))
-    has_freq_intent = bool(re.search(r"\bFreq\b", head, re.I)) or any("VIBRATIONAL ANALYSIS" in ln for ln in lines)
 
-    ok = term
-    if has_opt_intent:
-        ok = ok and opt_done
-    if has_freq_intent:
-        ok = ok and freq_done
+    ok = bool(term and opt_converged)
 
     if ok:
         status, reason = "OK", ""
@@ -2104,18 +2151,18 @@ def _scan_one(job_dir: Path, out_glob: str, ignore_glob: str) -> Dict[str, Any]:
         status = "FAIL"
         if not term:
             reason = "not_terminated_normally"
-        elif has_opt_intent and not opt_done:
-            reason = "opt_incomplete"
-        elif has_freq_intent and not freq_done:
-            reason = "freq_incomplete"
         else:
-            reason = "unknown"
+            reason = "opt_not_converged"
+
+
 
     return {
         "path": str(job_dir.resolve()),
         "out_file": str(out_file.resolve()),
         "terminated_normally": term,
         "opt_done": opt_done,
+        "opt_converged": opt_converged,
+        "opt_max_cycles_reached": opt_max_cycles_reached,
         "freq_done": freq_done,
         "n_imag": "" if n_imag is None else n_imag,
         "status": status,
@@ -2140,6 +2187,8 @@ def scan_cmd(
     seen_paths = set()
     for d in sorted({p.resolve() for p in root.rglob("*") if p.is_dir()}):
         if any(part.startswith(".") for part in d.parts):
+            continue
+        if _job_dir_has_active_sentinel(d):
             continue
         rec = _scan_one(d, out_glob, ignore_glob)
         if rec["fail_reason"] == "no_out":
@@ -2194,6 +2243,8 @@ def mark_cmd(
         p = Path(str(raw_path).strip()).expanduser().resolve()
         if not p.is_dir():
             typer.echo(f"Skipping missing job dir: {p}")
+            continue
+        if _job_dir_has_active_sentinel(p):
             continue
 
         if status == "OK" and not only_fail:
@@ -2424,5 +2475,6 @@ def parse_cmd(
             n_written += 1
 
     typer.secho(f"Wrote {n_written} record(s) → {out_jsonl}", fg=typer.colors.GREEN)
+
 
 
